@@ -1,0 +1,354 @@
+// ==UserScript==
+// @name         Ozon Smart Control (bug ver)
+// @namespace    http://tampermonkey.net/
+// @version      4.4
+// @description  Полная клавиатурная автоматизация ПВЗ с имитацией физических кликов мыши
+// @author       desslow
+// @match        https://*.ozon.ru/*
+// @match        https://*.ozon.work/*
+// @grant        none
+// ==/UserScript==
+
+(function() {
+    'use strict';
+
+    // Константы клавиш NumPad
+    const KEY_ENTER = 'NumpadEnter';
+    const KEY_ADD = 'NumpadAdd';         // Клавиша +
+    const KEY_SUBTRACT = 'NumpadSubtract'; // Клавиша -
+    const KEY_MULTIPLY = 'NumpadMultiply'; // Клавиша * (переключатель пакетов)
+    const KEY_CHECK = 'Numpad0';          // Клавиша 0 (Проверить)
+
+    const REASON_KEYS = ['Numpad1', 'Numpad2', 'Numpad3', 'Numpad4', 'Numpad5'];
+
+    // Состояние скрипта
+    let activePackageIndex = 0;
+    let lastScannedBarcode = '';
+    let lastScanTime = 0;
+    let scanBuffer = '';
+    let lastScanKeyTime = Date.now();
+
+    let enterHoldTimeout = null;
+    let isEnterHolding = false;
+
+    console.log("[Smart Control] Скрипт запущен. Нажмите '0' для двойного клика 'Проверить'.");
+
+    // --------------------------------------------------------
+    // 1. АВТОМАТИЧЕСКАЯ ОТРИСОВКА ИНТЕРФЕЙСА
+    // --------------------------------------------------------
+    setInterval(() => {
+        highlightActivePackage();
+        injectReasonNumbers();
+    }, 200);
+
+    function highlightActivePackage() {
+        const counters = document.querySelectorAll('.ozi__input-count__group__ezrQe');
+        counters.forEach((counter, idx) => {
+            if (idx === activePackageIndex) {
+                counter.style.outline = '3px solid #005bff';
+                counter.style.outlineOffset = '2px';
+                counter.style.borderRadius = '4px';
+                counter.style.boxShadow = '0 0 8px rgba(0, 91, 255, 0.5)';
+            } else {
+                counter.style.outline = 'none';
+                counter.style.boxShadow = 'none';
+            }
+        });
+    }
+
+    function injectReasonNumbers() {
+        for (let i = 0; i <= 4; i++) {
+            const dropdownItem = document.querySelector(`[data-testid="postingDropDownItemToAnnulate-${i}"]`);
+            if (!dropdownItem) continue;
+
+            const labelContainer = dropdownItem.querySelector('.ozi__data-content__label__TA_HC');
+            if (!labelContainer) continue;
+
+            if (labelContainer.querySelector('.numpad-badge-helper')) continue;
+
+            const badge = document.createElement('span');
+            badge.className = 'numpad-badge-helper';
+            badge.style.marginLeft = '12px';
+            badge.style.padding = '2px 6px';
+            badge.style.background = '#e4e6e9';
+            badge.style.color = '#4e5b6c';
+            badge.style.border = '1px solid #cbced4';
+            badge.style.borderRadius = '4px';
+            badge.style.fontSize = '11px';
+            badge.style.fontWeight = 'bold';
+            badge.style.fontFamily = 'monospace';
+            badge.style.display = 'inline-block';
+            badge.style.boxShadow = '0 1px 0 rgba(0,0,0,0.15)';
+            badge.textContent = `[Num ${i + 1}]`;
+
+            labelContainer.appendChild(badge);
+        }
+    }
+
+    // Имитация полноценного физического клика мыши (mousedown -> mouseup -> click)
+    function simulateRealClick(element) {
+        if (!element) return;
+        const eventTypes = ['mousedown', 'mouseup', 'click'];
+        eventTypes.forEach(type => {
+            const ev = new MouseEvent(type, {
+                bubbles: true,
+                cancelable: true,
+                view: window
+            });
+            element.dispatchEvent(ev);
+        });
+    }
+
+    // Поиск кнопки-стрелочки выпадающего меню в строке товара
+    function findArrowButton(row) {
+        if (!row) return null;
+
+        // Перебираем кнопки и находим ту, которая содержит стрелку и не является основной кнопкой
+        const buttons = Array.from(row.querySelectorAll('button'));
+        return buttons.find(btn => {
+            const hasSvg = !!btn.querySelector('svg');
+            const isMainBtn = btn.hasAttribute('data-testid') &&
+                              (btn.getAttribute('data-testid') === 'btnToAnnulate' ||
+                               btn.getAttribute('data-testid') === 'btnToCheck');
+            return hasSvg && !isMainBtn;
+        }) || row.querySelector('button[class*="noLeftRadius"]') || row.querySelector('button[class*="_toggle_"]');
+    }
+
+    // --------------------------------------------------------
+    // 2. ГЛОБАЛЬНЫЙ ОБРАБОТЧИК КЛАВИШ
+    // --------------------------------------------------------
+    window.addEventListener('keydown', function(e) {
+        const now = Date.now();
+
+        if (now - lastScanKeyTime > 50) {
+            scanBuffer = '';
+        }
+        lastScanKeyTime = now;
+
+        if (e.key === 'Enter' && e.code !== KEY_ENTER) {
+            const barcode = scanBuffer.trim();
+            scanBuffer = '';
+            if (barcode.length >= 8) {
+                handleBarcodeScan(barcode);
+            }
+            return;
+        }
+
+        if (e.key.length === 1 && e.key >= '0' && e.key <= '9') {
+            scanBuffer += e.key;
+        }
+
+        // --- КЛАВИШИ NUMPAD ---
+
+        // Переключение пакета (*)
+        if (e.code === KEY_MULTIPLY) {
+            e.preventDefault();
+            e.stopPropagation();
+            activePackageIndex = activePackageIndex === 0 ? 1 : 0;
+            highlightActivePackage();
+            return;
+        }
+
+        // Пакеты (+ и -)
+        if (e.code === KEY_ADD || e.code === KEY_SUBTRACT) {
+            e.preventDefault();
+            e.stopPropagation();
+            adjustPackage(e.code === KEY_ADD ? 'increment' : 'decrement');
+            return;
+        }
+
+        // Кнопка Проверить (Num 0) с двойным кликом
+        if (e.code === KEY_CHECK) {
+            e.preventDefault();
+            e.stopPropagation();
+            triggerBtnToCheck();
+            return;
+        }
+
+        // Быстрый выбор причины отмены (Num 1-5)
+        if (REASON_KEYS.includes(e.code)) {
+            e.preventDefault();
+            e.stopPropagation();
+            const reasonIndex = REASON_KEYS.indexOf(e.code);
+            selectAnnulationReason(reasonIndex);
+            return;
+        }
+
+        // Безопасный клик по Enter на NumPad
+        if (e.code === KEY_ENTER) {
+            e.preventDefault();
+            e.stopPropagation();
+
+            if (isEnterHolding) return;
+
+            const mainBtn = findMainActionButton();
+            if (!mainBtn) return;
+
+            const btnText = mainBtn.textContent.trim();
+
+            if (btnText === 'Провести оплату') {
+                isEnterHolding = true;
+                console.log("[Smart Control] Ожидание оплаты. Удерживайте NumPad Enter 0.4 сек...");
+
+                mainBtn.style.transition = 'background-color 0.4s ease';
+                mainBtn.style.backgroundColor = '#ff9800';
+                mainBtn.style.color = '#fff';
+
+                enterHoldTimeout = setTimeout(() => {
+                    simulateRealClick(mainBtn);
+                    resetMainButtonVisuals(mainBtn);
+                    isEnterHolding = false;
+                }, 400);
+            } else {
+                simulateRealClick(mainBtn);
+            }
+        }
+    }, true);
+
+    window.addEventListener('keyup', function(e) {
+        if (e.code === KEY_ENTER) {
+            if (isEnterHolding) {
+                clearTimeout(enterHoldTimeout);
+                const mainBtn = findMainActionButton();
+                if (mainBtn) {
+                    resetMainButtonVisuals(mainBtn);
+                }
+                isEnterHolding = false;
+            }
+        }
+    }, true);
+
+    // --------------------------------------------------------
+    // 3. СЛУЖЕБНЫЕ СКРИПТОВЫЕ ФУНКЦИИ
+    // --------------------------------------------------------
+    function adjustPackage(action) {
+        const counters = document.querySelectorAll('.ozi__input-count__group__ezrQe');
+        if (counters.length <= activePackageIndex) return;
+
+        const counter = counters[activePackageIndex];
+        const buttonClass = action === 'increment'
+            ? '.ozi__input-count__increment__ezrQe'
+            : '.ozi__input-count__decrement__ezrQe';
+
+        const btn = counter.querySelector(buttonClass);
+        if (btn && !btn.disabled) {
+            simulateRealClick(btn);
+        }
+    }
+
+    function findMainActionButton() {
+        const actionBtn = document.querySelector('[data-testid="giveOutActionButton"]');
+        if (actionBtn) return actionBtn;
+
+        const allButtons = Array.from(document.querySelectorAll('button'));
+        return allButtons.find(btn => {
+            const txt = btn.textContent.trim();
+            return txt === 'На главную' || txt === 'Аннулировать';
+        });
+    }
+
+    function resetMainButtonVisuals(btn) {
+        btn.style.backgroundColor = '';
+        btn.style.color = '';
+    }
+
+    // Двойной скан: автоматическая аннуляция по ШК
+    function handleBarcodeScan(barcode) {
+        const now = Date.now();
+        if (barcode === lastScannedBarcode && (now - lastScanTime) < 1500) {
+            console.log(`[Smart Control] Дабл-скан товара: ${barcode}. Запуск отмены...`);
+
+            const itemRow = document.querySelector(`[data-test-article-id="${barcode}"]`);
+            if (itemRow) {
+                itemRow.style.outline = '3px solid #ff4d4f';
+                setTimeout(() => { itemRow.style.outline = 'none'; }, 500);
+
+                selectAnnulationReason(0, itemRow);
+            } else {
+                console.error(`[Smart Control] Строка товара с ШК ${barcode} не найдена.`);
+            }
+            lastScannedBarcode = '';
+        } else {
+            lastScannedBarcode = barcode;
+            lastScanTime = now;
+            console.log(`[Smart Control] Первое сканирование ШК: ${barcode}`);
+        }
+    }
+
+    // Двойной клик на кнопку "Проверить"
+    function triggerBtnToCheck() {
+        let targetRow = null;
+        if (lastScannedBarcode) {
+            targetRow = document.querySelector(`[data-test-article-id="${lastScannedBarcode}"]`);
+        }
+
+        const btn = targetRow
+            ? targetRow.querySelector('[data-testid="btnToCheck"]')
+            : document.querySelector('[data-testid="btnToCheck"]');
+
+        if (btn) {
+            console.log("[Smart Control] Выполняем двойной клик по кнопке 'Проверить'...");
+
+            // Имитируем два быстрых клика подряд
+            simulateRealClick(btn);
+            setTimeout(() => {
+                simulateRealClick(btn);
+
+                // Дополнительно отправляем системное событие dblclick для React
+                const dblEvent = new MouseEvent('dblclick', {
+                    bubbles: true,
+                    cancelable: true,
+                    view: window
+                });
+                btn.dispatchEvent(dblEvent);
+            }, 50);
+        } else {
+            console.warn("[Smart Control] Кнопка 'Проверить' не найдена.");
+        }
+    }
+
+    // Быстрый выбор причины аннуляции по NumPad 1-5
+    function selectAnnulationReason(index, specificRow = null) {
+        const isMenuOpen = !!document.querySelector('.ozi__dropdown__wrapper__ahUR2');
+
+        if (isMenuOpen) {
+            const dropdownOption = document.querySelector(`[data-testid="postingDropDownItemToAnnulate-${index}"]`);
+            if (dropdownOption) {
+                simulateRealClick(dropdownOption);
+                console.log(`[Smart Control] Причина №${index + 1} выбрана.`);
+            }
+        } else {
+            let targetRow = specificRow;
+            if (!targetRow && lastScannedBarcode) {
+                targetRow = document.querySelector(`[data-test-article-id="${lastScannedBarcode}"]`);
+            }
+            if (!targetRow) {
+                targetRow = document.querySelector('[data-testid="logItem"]');
+            }
+
+            if (!targetRow) {
+                console.error("[Smart Control] Не найдена строка товара.");
+                return;
+            }
+
+            const arrowButton = findArrowButton(targetRow);
+            if (!arrowButton) {
+                console.error("[Smart Control] Кнопка-стрелка не найдена.");
+                return;
+            }
+
+            console.log("[Smart Control] Открываем выпадающий список имитацией клика...");
+            simulateRealClick(arrowButton);
+
+            setTimeout(() => {
+                const dropdownOption = document.querySelector(`[data-testid="postingDropDownItemToAnnulate-${index}"]`);
+                if (dropdownOption) {
+                    simulateRealClick(dropdownOption);
+                    console.log(`[Smart Control] Причина №${index + 1} успешно выбрана.`);
+                } else {
+                    console.error(`[Smart Control] Ошибка: Пункт причины №${index + 1} не появился.`);
+                }
+            }, 60); // Небольшая задержка, чтобы Tippy успел отрендерить поповер
+        }
+    }
+})();
