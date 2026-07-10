@@ -1,0 +1,375 @@
+// ==UserScript==
+// @name         Ozon Smart Control (Pro)
+// @namespace    http://tampermonkey.net/
+// @version      6.0
+// @description  Полная клавиатурная автоматизация выдачи товаров клиентам.
+// @author       desslow
+// @match        https://*.ozon.ru/*
+// @match        https://*.ozon.work/*
+// @grant        none
+// ==/UserScript==
+
+(function() {
+    'use strict';
+
+    // Константы клавиш
+    const KEY_ENTER = 'NumpadEnter';
+    const KEY_ADD = 'NumpadAdd';
+    const KEY_SUBTRACT = 'NumpadSubtract';
+    const KEY_MULTIPLY = 'NumpadMultiply';
+    const KEY_CHECK = 'Numpad0';
+
+    const REASON_KEYS = ['Numpad1', 'Numpad2', 'Numpad3', 'Numpad4', 'Numpad5'];
+
+    // Состояние скрипта
+    let activePackageIndex = 0;
+    let lastScannedBarcode = '';
+    let lastScannedItemNode = null;
+    let lastScanTime = 0;
+    let scanBuffer = '';
+    let lastScanKeyTime = Date.now();
+
+    let enterHoldTimeout = null;
+    let isEnterHolding = false;
+    let heldButton = null; // Для четкого обнуления анимации
+
+    // Таймер для дабл-тапа 0
+    let numpad0Presses = 0;
+    let numpad0Timer = null;
+
+    console.log("[Smart Control] Скрипт V6 запущен.");
+
+    // --------------------------------------------------------
+    // 1. АВТОМАТИЧЕСКАЯ ОТРИСОВКА ИНТЕРФЕЙСА
+    // --------------------------------------------------------
+    setInterval(() => {
+        highlightActivePackage();
+        injectReasonNumbers();
+    }, 200);
+
+    function highlightActivePackage() {
+        const counters = document.querySelectorAll('[class*="input-count__group"]');
+        counters.forEach((counter, idx) => {
+            if (idx === activePackageIndex) {
+                counter.style.outline = '3px solid #005bff';
+                counter.style.outlineOffset = '2px';
+                counter.style.borderRadius = '4px';
+                counter.style.boxShadow = '0 0 8px rgba(0, 91, 255, 0.5)';
+            } else {
+                counter.style.outline = 'none';
+                counter.style.boxShadow = 'none';
+            }
+        });
+    }
+
+    function injectReasonNumbers() {
+        for (let i = 0; i <= 4; i++) {
+            const dropdownItem = document.querySelector(`[data-testid="postingDropDownItemToAnnulate-${i}"]`);
+            if (!dropdownItem) continue;
+
+            const labelContainer = dropdownItem.querySelector('[class*="data-content__label"]') || dropdownItem;
+            if (!labelContainer || labelContainer.querySelector('.numpad-badge-helper')) continue;
+
+            const badge = document.createElement('span');
+            badge.className = 'numpad-badge-helper';
+            badge.style.marginLeft = '12px';
+            badge.style.padding = '2px 6px';
+            badge.style.background = '#e4e6e9';
+            badge.style.color = '#4e5b6c';
+            badge.style.border = '1px solid #cbced4';
+            badge.style.borderRadius = '4px';
+            badge.style.fontSize = '11px';
+            badge.style.fontWeight = 'bold';
+            badge.style.fontFamily = 'monospace';
+            badge.style.display = 'inline-block';
+            badge.style.boxShadow = '0 1px 0 rgba(0,0,0,0.15)';
+            badge.textContent = `[Num ${i + 1}]`;
+
+            labelContainer.appendChild(badge);
+        }
+    }
+
+    // Имитация настоящего клика (React 17+)
+    function simulateRealClick(element) {
+        if (!element) return;
+        ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click'].forEach(type => {
+            const ev = new MouseEvent(type, { bubbles: true, cancelable: true, view: window, buttons: 1 });
+            element.dispatchEvent(ev);
+        });
+    }
+
+    // --------------------------------------------------------
+    // 2. ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ФОКУСА
+    // --------------------------------------------------------
+    function isInputActive() {
+        const el = document.activeElement;
+        return el && (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' || el.isContentEditable);
+    }
+
+    function findItemByBarcode(barcode) {
+        const textareas = document.querySelectorAll('textarea[aria-hidden="true"]');
+        for (let ta of textareas) {
+            if (ta.value && ta.value.trim().toLowerCase() === barcode.trim().toLowerCase()) {
+                return ta.closest('[data-testid]');
+            }
+        }
+        return document.querySelector(`[data-testid="${barcode}"]`);
+    }
+
+    function getTargetItem() {
+        if (lastScannedItemNode && document.contains(lastScannedItemNode)) return lastScannedItemNode;
+        const successCard = document.querySelector('[class*="_success_"]');
+        if (successCard) return successCard.closest('[data-testid]');
+        const anyBtn = document.querySelector('[data-testid="btnToCheck"], [data-testid="btnToGiveOut"]');
+        if (anyBtn) return anyBtn.closest('[data-testid]');
+        return null;
+    }
+
+    // --------------------------------------------------------
+    // 3. ГЛОБАЛЬНЫЙ ОБРАБОТЧИК КЛАВИШ
+    // --------------------------------------------------------
+    window.addEventListener('keydown', function(e) {
+        const now = Date.now();
+
+        if (now - lastScanKeyTime > 100) scanBuffer = '';
+        lastScanKeyTime = now;
+
+        // --- КНОПКА ВОЗВРАТА (Esc) ---
+        if (e.key === 'Escape') {
+            // Ищем SVG с четким путем M6.293 2.293 (стрелочка назад в модалках)
+            const backSvgPath = document.querySelector('path[d^="M6.293 2.293"]');
+            if (backSvgPath) {
+                const backBtn = backSvgPath.closest('button');
+                if (backBtn) {
+                    e.preventDefault(); e.stopPropagation();
+                    simulateRealClick(backBtn);
+                }
+            }
+            return;
+        }
+
+        // Обработка сканирования ШК
+        if (e.key === 'Enter' && e.code !== KEY_ENTER) {
+            const barcode = scanBuffer.trim();
+            scanBuffer = '';
+            if (barcode.length >= 8) handleBarcodeScan(barcode);
+            return;
+        }
+
+        if (e.key.length === 1 && e.key >= '0' && e.key <= '9') {
+            scanBuffer += e.key;
+        }
+
+        // --- NUMPAD ---
+        if (isInputActive() && e.code !== KEY_ENTER) return;
+
+        if (e.code === KEY_MULTIPLY) {
+            e.preventDefault(); e.stopPropagation();
+            activePackageIndex = activePackageIndex === 0 ? 1 : 0;
+            highlightActivePackage();
+            return;
+        }
+
+        if (e.code === KEY_ADD || e.code === KEY_SUBTRACT) {
+            e.preventDefault(); e.stopPropagation();
+            adjustPackage(e.code === KEY_ADD ? 'increment' : 'decrement');
+            return;
+        }
+
+        if (e.code === KEY_CHECK) {
+            e.preventDefault(); e.stopPropagation();
+            numpad0Presses++;
+            if (numpad0Presses === 1) {
+                numpad0Timer = setTimeout(() => { numpad0Presses = 0; }, 400);
+            } else if (numpad0Presses === 2) {
+                clearTimeout(numpad0Timer);
+                numpad0Presses = 0;
+                triggerBtnToCheck();
+            }
+            return;
+        }
+
+        if (REASON_KEYS.includes(e.code)) {
+            e.preventDefault(); e.stopPropagation();
+            const reasonIndex = REASON_KEYS.indexOf(e.code);
+            openDropdownAndSelect(getTargetItem(), reasonIndex);
+            return;
+        }
+
+        // --- Numpad Enter ---
+        if (e.code === KEY_ENTER) {
+            e.preventDefault(); e.stopPropagation();
+            if (isEnterHolding) return;
+
+            const mainBtn = findMainActionButton();
+            if (!mainBtn) return;
+
+            const btnText = mainBtn.textContent.trim();
+
+            // Если нужна 0.4 сек анимация
+            if (btnText === 'Провести оплату' || btnText === 'Попробовать еще') {
+                isEnterHolding = true;
+                heldButton = mainBtn;
+
+                console.log(`[Smart Control] Удерживайте Enter для: ${btnText}`);
+
+                // Задаем анимацию "загрузочной полосы" (mexican pink - #e4007c)
+                heldButton.style.setProperty('background-image', 'linear-gradient(90deg, #e4007c 50%, transparent 50%)', 'important');
+                heldButton.style.setProperty('background-size', '200% 100%', 'important');
+                heldButton.style.setProperty('background-position', '100% 0', 'important'); // Полоска спрятана справа
+                heldButton.style.setProperty('color', '#fff', 'important');
+                heldButton.style.setProperty('transition', 'none', 'important');
+
+                void heldButton.offsetWidth; // Принудительный рендер (reflow)
+
+                heldButton.style.setProperty('transition', 'background-position 0.4s linear', 'important');
+                heldButton.style.setProperty('background-position', '0 0', 'important'); // Едет влево на 100% (закрашивает кнопку)
+
+                enterHoldTimeout = setTimeout(() => {
+                    simulateRealClick(heldButton);
+                    resetMainButtonVisuals(heldButton);
+                    isEnterHolding = false;
+                    heldButton = null;
+                }, 400);
+            } else {
+                simulateRealClick(mainBtn); // Обычный клик для "Подтвердить" и т.п.
+            }
+        }
+    }, true);
+
+    // Сброс при раннем отпускании клавиши Enter
+    window.addEventListener('keyup', function(e) {
+        if (e.code === KEY_ENTER) {
+            if (isEnterHolding) {
+                clearTimeout(enterHoldTimeout);
+                if (heldButton) resetMainButtonVisuals(heldButton);
+                isEnterHolding = false;
+                heldButton = null;
+            }
+        }
+    }, true);
+
+    // --------------------------------------------------------
+    // 4. СЛУЖЕБНЫЕ СКРИПТОВЫЕ ФУНКЦИИ
+    // --------------------------------------------------------
+    function resetMainButtonVisuals(btn) {
+        btn.style.removeProperty('background-image');
+        btn.style.removeProperty('background-size');
+        btn.style.removeProperty('background-position');
+        btn.style.removeProperty('transition');
+        btn.style.removeProperty('color');
+    }
+
+    function adjustPackage(action) {
+        const counters = document.querySelectorAll('[class*="input-count__group"]');
+        if (counters.length <= activePackageIndex) return;
+        const buttonClass = action === 'increment' ? '[class*="increment"]' : '[class*="decrement"]';
+        const btn = counters[activePackageIndex].querySelector(buttonClass);
+        if (btn && !btn.disabled) simulateRealClick(btn);
+    }
+
+    function findMainActionButton() {
+        const priorities = ['Подтвердить', 'Попробовать еще', 'Повторить', 'Выдать', 'Продолжить', 'Провести оплату', 'Аннулировать', 'На главную'];
+        const allButtons = Array.from(document.querySelectorAll('button'));
+
+        for (let text of priorities) {
+            const btn = allButtons.find(b => b.textContent.trim() === text && !b.disabled);
+            if (btn) return btn;
+        }
+        return document.querySelector('[data-testid="giveOutActionButton"]');
+    }
+
+    function handleBarcodeScan(barcode) {
+        const now = Date.now();
+        const item = findItemByBarcode(barcode);
+
+        if (item) lastScannedItemNode = item;
+
+        if (barcode === lastScannedBarcode && (now - lastScanTime) < 1500) {
+            console.log(`[Smart Control] Дабл-скан: ${barcode}. Запуск отмены...`);
+            if (item) {
+                item.style.outline = '3px solid #ff4d4f';
+                setTimeout(() => { item.style.outline = 'none'; }, 500);
+            }
+            openDropdownAndSelect(item || getTargetItem(), 'DOUBLE_SCAN');
+            lastScannedBarcode = '';
+        } else {
+            lastScannedBarcode = barcode;
+            lastScanTime = now;
+        }
+    }
+
+    function triggerBtnToCheck() {
+        const targetItem = getTargetItem();
+        const btn = targetItem
+            ? targetItem.querySelector('[data-testid="btnToCheck"]')
+            : document.querySelector('[data-testid="btnToCheck"]');
+        if (btn) simulateRealClick(btn);
+    }
+
+    // Умный выбор причины (и открытие/переоткрытие списка при необходимости)
+    function openDropdownAndSelect(targetItem, reasonIndexOrDoubleScan) {
+        if (!targetItem) return;
+
+        const isDoubleScan = reasonIndexOrDoubleScan === 'DOUBLE_SCAN';
+        const reasonIndex = typeof reasonIndexOrDoubleScan === 'number' ? reasonIndexOrDoubleScan : null;
+
+        // Логика клика нужной опции в меню
+        const selectFromOpenMenu = () => {
+            let targetOption = null;
+
+            if (isDoubleScan) {
+                const options = Array.from(document.querySelectorAll('[data-testid^="postingDropDownItemToAnnulate"]'));
+                targetOption = options.find(el => {
+                    const text = el.textContent.toLowerCase();
+                    return text.includes('решени') || text.includes('отказ клиента');
+                });
+                if (!targetOption && options.length > 0) targetOption = options[0]; // Фолбек
+            } else {
+                targetOption = document.querySelector(`[data-testid="postingDropDownItemToAnnulate-${reasonIndex}"]`);
+            }
+
+            if (targetOption) {
+                simulateRealClick(targetOption.closest('button') || targetOption.closest('[role="menuitem"]') || targetOption);
+                console.log(`[Smart Control] Причина выбрана!`);
+            }
+        };
+
+        // 1. Если меню уже открыто - просто выбираем
+        if (document.querySelectorAll('[data-testid^="postingDropDownItemToAnnulate"]').length > 0) {
+            selectFromOpenMenu();
+            return;
+        }
+
+        // 2. Ищем кнопку-стрелку (если нужно открыть или изменить причину)
+        let arrowBtn = null;
+        const splitBtns = targetItem.querySelectorAll('[class*="splitButton"] button');
+
+        if (splitBtns.length >= 2) {
+            arrowBtn = splitBtns[splitBtns.length - 1]; // Обычно вторая кнопка в сплит-группе
+        } else {
+            // Если структура изменена, ищем любую кнопку без текста (только иконка), которая не является основной
+            const allBtns = Array.from(targetItem.querySelectorAll('button'));
+            arrowBtn = allBtns.find(b => b.querySelector('svg') && !b.textContent.trim() && !b.getAttribute('data-testid')?.match(/btnTo(Check|GiveOut|Annulate|Keep)/i));
+        }
+
+        if (!arrowBtn) {
+            console.error("[Smart Control] Не найдена кнопка раскрытия списка.");
+            return;
+        }
+
+        // Кликаем и ждем появления DOM
+        simulateRealClick(arrowBtn);
+
+        let attempts = 0;
+        const checkDropdown = setInterval(() => {
+            attempts++;
+            if (document.querySelectorAll('[data-testid^="postingDropDownItemToAnnulate"]').length > 0) {
+                clearInterval(checkDropdown);
+                selectFromOpenMenu();
+            } else if (attempts > 15) { // Отсечка через ~1.5 сек
+                clearInterval(checkDropdown);
+            }
+        }, 100);
+    }
+})();
