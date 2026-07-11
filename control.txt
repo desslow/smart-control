@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         Ozon Smart Control (Pro)
+// @name         Ozon Smart Control (by desslow)
 // @namespace    http://tampermonkey.net/
-// @version      6.0
-// @description  Полная клавиатурная автоматизация выдачи товаров клиентам.
+// @version      7.3
+// @description  Замена ручной выдачи товаров клиентам на клавиатурный режим.
 // @author       desslow
 // @match        https://*.ozon.ru/*
 // @match        https://*.ozon.work/*
@@ -23,21 +23,64 @@
 
     // Состояние скрипта
     let activePackageIndex = 0;
+
+    // ФОКУС: Храним строку ШК для динамического переключения
+    let activeBarcode = '';
     let lastScannedBarcode = '';
-    let lastScannedItemNode = null;
     let lastScanTime = 0;
+
     let scanBuffer = '';
     let lastScanKeyTime = Date.now();
 
+    // Блокировка и анимации
     let enterHoldTimeout = null;
     let isEnterHolding = false;
-    let heldButton = null; // Для четкого обнуления анимации
+    let heldButton = null;
+    let enterBlockUntil = 0; // Время блокировки Enter после аннуляции
 
     // Таймер для дабл-тапа 0
     let numpad0Presses = 0;
     let numpad0Timer = null;
 
-    console.log("[Smart Control] Скрипт V6 запущен.");
+    // Звук
+    let audioCtx = null;
+
+    console.log("[Smart Control] Скрипт версии 7.3 запущен. Умный динамический фокус активен.");
+
+    // --------------------------------------------------------
+    // 0. ВНЕДРЕНИЕ CSS ДЛЯ АНИМАЦИИ И ФОКУСА
+    // --------------------------------------------------------
+    const style = document.createElement('style');
+    style.innerHTML = `
+        /* Визуальный фокус выбранного товара */
+        .smart-control-focus {
+            outline: 3px solid #ff9800 !important;
+            outline-offset: -2px !important;
+            box-shadow: 0 0 12px rgba(255, 152, 0, 0.4) !important;
+            border-radius: 8px;
+            transition: outline 0.2s, box-shadow 0.2s;
+        }
+        /* Умная анимация прогресс-бара */
+        .smart-btn-progress {
+            position: relative;
+            overflow: hidden;
+            border: none !important;
+        }
+        .smart-btn-progress::before {
+            content: '';
+            position: absolute;
+            top: 0; left: 0; height: 100%;
+            width: var(--smart-progress, 0%);
+            background-color: #e4007c !important; /* Mexican Pink */
+            transition: width 0.4s linear;
+            z-index: 0;
+        }
+        .smart-btn-progress > div {
+            position: relative;
+            z-index: 1;
+        }
+    `;
+    document.head.appendChild(style);
 
     // --------------------------------------------------------
     // 1. АВТОМАТИЧЕСКАЯ ОТРИСОВКА ИНТЕРФЕЙСА
@@ -45,6 +88,7 @@
     setInterval(() => {
         highlightActivePackage();
         injectReasonNumbers();
+        maintainFocusVisual();
     }, 200);
 
     function highlightActivePackage() {
@@ -89,7 +133,14 @@
         }
     }
 
-    // Имитация настоящего клика (React 17+)
+    function maintainFocusVisual() {
+        document.querySelectorAll('.smart-control-focus').forEach(el => el.classList.remove('smart-control-focus'));
+        const target = getTargetItem();
+        if (target) {
+            target.classList.add('smart-control-focus');
+        }
+    }
+
     function simulateRealClick(element) {
         if (!element) return;
         ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click'].forEach(type => {
@@ -99,44 +150,101 @@
     }
 
     // --------------------------------------------------------
-    // 2. ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ФОКУСА
+    // 2. ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ФОКУСА И ЗВУКА
     // --------------------------------------------------------
+    function initAudio() {
+        if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+        if (audioCtx.state === 'suspended') audioCtx.resume();
+    }
+
+    function playAnnulateAlert() {
+        initAudio();
+        const oscillator = audioCtx.createOscillator();
+        const gainNode = audioCtx.createGain();
+        oscillator.type = 'square';
+        oscillator.frequency.setValueAtTime(200, audioCtx.currentTime);
+        oscillator.frequency.exponentialRampToValueAtTime(100, audioCtx.currentTime + 0.2);
+        gainNode.gain.setValueAtTime(0.05, audioCtx.currentTime);
+        gainNode.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + 0.2);
+        oscillator.connect(gainNode);
+        gainNode.connect(audioCtx.destination);
+        oscillator.start();
+        oscillator.stop(audioCtx.currentTime + 0.2);
+    }
+
     function isInputActive() {
         const el = document.activeElement;
         return el && (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' || el.isContentEditable);
     }
 
     function findItemByBarcode(barcode) {
-        const textareas = document.querySelectorAll('textarea[aria-hidden="true"]');
-        for (let ta of textareas) {
-            if (ta.value && ta.value.trim().toLowerCase() === barcode.trim().toLowerCase()) {
-                return ta.closest('[data-testid]');
+        if (!barcode) return null;
+        const lowerBarcode = barcode.trim().toLowerCase();
+
+        // Поиск по скрытым textarea и полям ввода (стандартное хранение Ozon)
+        const textareas = document.querySelectorAll('textarea[aria-hidden="true"], input[type="text"], input[type="hidden"]');
+        for (let el of textareas) {
+            const val = el.value || el.getAttribute('value') || el.textContent;
+            if (val && val.trim().toLowerCase() === lowerBarcode) {
+                return el.closest('[class*="_card_"], [class*="_item_"]') || el.parentElement;
             }
         }
-        return document.querySelector(`[data-testid="${barcode}"]`);
+
+        // Резервный поиск по data-testid (точное совпадение или частичное)
+        const direct = document.querySelector(`[data-testid*="${barcode}"]`);
+        return direct ? (direct.closest('[class*="_card_"], [class*="_item_"]') || direct) : null;
     }
 
     function getTargetItem() {
-        if (lastScannedItemNode && document.contains(lastScannedItemNode)) return lastScannedItemNode;
-        const successCard = document.querySelector('[class*="_success_"]');
-        if (successCard) return successCard.closest('[data-testid]');
-        const anyBtn = document.querySelector('[data-testid="btnToCheck"], [data-testid="btnToGiveOut"]');
-        if (anyBtn) return anyBtn.closest('[data-testid]');
-        return null;
+        let item = null;
+
+        // 1. Ищем по явному фокусу (ШК от сканера или клика)
+        if (activeBarcode) {
+            item = findItemByBarcode(activeBarcode);
+        }
+
+        // 2. Если нет явного фокуса — ищем зелёную карточку (_success_)
+        if (!item) {
+            const successCards = document.querySelectorAll('[class*="_success_"]');
+            if (successCards.length > 0) {
+                item = successCards[successCards.length - 1].closest('[class*="_card_"]');
+            }
+        }
+
+        // 3. Фолбек: берем просто первый товар в списке
+        if (!item) {
+            const anyBtn = document.querySelector('[data-testid="btnToCheck"], [data-testid="btnToGiveOut"]');
+            if (anyBtn) item = anyBtn.closest('[class*="_card_"]');
+        }
+
+        return item;
     }
 
     // --------------------------------------------------------
-    // 3. ГЛОБАЛЬНЫЙ ОБРАБОТЧИК КЛАВИШ
+    // 3. ГЛОБАЛЬНЫЙ ОБРАБОТЧИК КЛАВИШ И МЫШИ
     // --------------------------------------------------------
+
+    // Отслеживаем ручной клик по карточке, чтобы перенести на нее фокус
+    window.addEventListener('mousedown', function(e) {
+        const card = e.target.closest('[class*="_card_"], [class*="_item_"]');
+        if (card) {
+            const ta = card.querySelector('textarea[aria-hidden="true"], input[type="text"]');
+            if (ta) {
+                activeBarcode = ta.value || ta.getAttribute('value') || ta.textContent;
+            }
+        }
+    }, true);
+
     window.addEventListener('keydown', function(e) {
         const now = Date.now();
-
-        if (now - lastScanKeyTime > 100) scanBuffer = '';
+        // Увеличен таймаут до 400 мс для корректной работы со всеми сканерами
+        if (now - lastScanKeyTime > 400) scanBuffer = '';
         lastScanKeyTime = now;
+
+        if (e.isTrusted && !audioCtx) initAudio();
 
         // --- КНОПКА ВОЗВРАТА (Esc) ---
         if (e.key === 'Escape') {
-            // Ищем SVG с четким путем M6.293 2.293 (стрелочка назад в модалках)
             const backSvgPath = document.querySelector('path[d^="M6.293 2.293"]');
             if (backSvgPath) {
                 const backBtn = backSvgPath.closest('button');
@@ -148,15 +256,17 @@
             return;
         }
 
-        // Обработка сканирования ШК
+        // --- Обработка сканирования ШК ---
         if (e.key === 'Enter' && e.code !== KEY_ENTER) {
             const barcode = scanBuffer.trim();
             scanBuffer = '';
-            if (barcode.length >= 8) handleBarcodeScan(barcode);
+            // Снижено ограничение длины, чтобы ловить все возможные форматы
+            if (barcode.length >= 6) handleBarcodeScan(barcode);
             return;
         }
 
-        if (e.key.length === 1 && e.key >= '0' && e.key <= '9') {
+        // ИСПРАВЛЕНИЕ: Разрешены не только цифры, но и латиница + тире + слэши
+        if (e.key.length === 1 && /^[a-zA-Z0-9\-\/]+$/.test(e.key)) {
             scanBuffer += e.key;
         }
 
@@ -189,60 +299,74 @@
             return;
         }
 
+        // --- АННУЛЯЦИЯ (Num 1-5) ---
         if (REASON_KEYS.includes(e.code)) {
             e.preventDefault(); e.stopPropagation();
             const reasonIndex = REASON_KEYS.indexOf(e.code);
-            openDropdownAndSelect(getTargetItem(), reasonIndex);
+            const target = getTargetItem();
+            if (target) {
+                const success = openDropdownAndSelect(target, reasonIndex);
+                if (success) {
+                    enterBlockUntil = Date.now() + 2000; // Блокируем Enter (БЕЗ ЗВУКА здесь)
+                }
+            } else {
+                console.warn("[Smart Control] Нет товара для аннуляции");
+            }
             return;
         }
 
         // --- Numpad Enter ---
         if (e.code === KEY_ENTER) {
             e.preventDefault(); e.stopPropagation();
+
             if (isEnterHolding) return;
 
             const mainBtn = findMainActionButton();
             if (!mainBtn) return;
 
+            // Блокировка мисскликов (ЗВУК ВОСПРОИЗВОДИТСЯ ТОЛЬКО ПРИ ОШИБКЕ)
+            if (Date.now() < enterBlockUntil) {
+                console.log("[Smart Control] Нажатие Enter заблокировано после выбора аннуляции!");
+                playAnnulateAlert();
+                mainBtn.style.transition = 'background-color 0.1s';
+                mainBtn.style.backgroundColor = '#ff4d4f';
+                setTimeout(() => mainBtn.style.backgroundColor = '', 200);
+                return;
+            }
+
             const btnText = mainBtn.textContent.trim();
 
-            // Если нужна 0.4 сек анимация
-            if (btnText === 'Провести оплату' || btnText === 'Попробовать еще') {
+            if (btnText === 'Провести оплату' || btnText === 'Попробовать ещё') {
                 isEnterHolding = true;
                 heldButton = mainBtn;
 
-                console.log(`[Smart Control] Удерживайте Enter для: ${btnText}`);
-
-                // Задаем анимацию "загрузочной полосы" (mexican pink - #e4007c)
-                heldButton.style.setProperty('background-image', 'linear-gradient(90deg, #e4007c 50%, transparent 50%)', 'important');
-                heldButton.style.setProperty('background-size', '200% 100%', 'important');
-                heldButton.style.setProperty('background-position', '100% 0', 'important'); // Полоска спрятана справа
-                heldButton.style.setProperty('color', '#fff', 'important');
-                heldButton.style.setProperty('transition', 'none', 'important');
-
-                void heldButton.offsetWidth; // Принудительный рендер (reflow)
-
-                heldButton.style.setProperty('transition', 'background-position 0.4s linear', 'important');
-                heldButton.style.setProperty('background-position', '0 0', 'important'); // Едет влево на 100% (закрашивает кнопку)
+                heldButton.classList.add('smart-btn-progress');
+                void heldButton.offsetWidth; // Reflow
+                heldButton.style.setProperty('--smart-progress', '100%');
+                heldButton.style.color = '#fff';
 
                 enterHoldTimeout = setTimeout(() => {
                     simulateRealClick(heldButton);
-                    resetMainButtonVisuals(heldButton);
                     isEnterHolding = false;
                     heldButton = null;
                 }, 400);
             } else {
-                simulateRealClick(mainBtn); // Обычный клик для "Подтвердить" и т.п.
+                simulateRealClick(mainBtn);
             }
         }
     }, true);
 
-    // Сброс при раннем отпускании клавиши Enter
+    // Сброс при отпускании Enter
     window.addEventListener('keyup', function(e) {
         if (e.code === KEY_ENTER) {
             if (isEnterHolding) {
                 clearTimeout(enterHoldTimeout);
-                if (heldButton) resetMainButtonVisuals(heldButton);
+                if (heldButton) {
+                    heldButton.style.setProperty('--smart-progress', '0%');
+                    setTimeout(() => {
+                        if (heldButton) heldButton.style.color = '';
+                    }, 400);
+                }
                 isEnterHolding = false;
                 heldButton = null;
             }
@@ -252,14 +376,6 @@
     // --------------------------------------------------------
     // 4. СЛУЖЕБНЫЕ СКРИПТОВЫЕ ФУНКЦИИ
     // --------------------------------------------------------
-    function resetMainButtonVisuals(btn) {
-        btn.style.removeProperty('background-image');
-        btn.style.removeProperty('background-size');
-        btn.style.removeProperty('background-position');
-        btn.style.removeProperty('transition');
-        btn.style.removeProperty('color');
-    }
-
     function adjustPackage(action) {
         const counters = document.querySelectorAll('[class*="input-count__group"]');
         if (counters.length <= activePackageIndex) return;
@@ -269,7 +385,7 @@
     }
 
     function findMainActionButton() {
-        const priorities = ['Подтвердить', 'Попробовать еще', 'Повторить', 'Выдать', 'Продолжить', 'Провести оплату', 'Аннулировать', 'На главную'];
+        const priorities = ['Подтвердить', 'Попробовать ещё', 'Повторить', 'Выдать', 'Продолжить', 'Провести оплату', 'Аннулировать', 'На главную'];
         const allButtons = Array.from(document.querySelectorAll('button'));
 
         for (let text of priorities) {
@@ -281,17 +397,19 @@
 
     function handleBarcodeScan(barcode) {
         const now = Date.now();
-        const item = findItemByBarcode(barcode);
-
-        if (item) lastScannedItemNode = item;
+        activeBarcode = barcode; // Жёстко фокусируемся на скане
+        const item = getTargetItem();
 
         if (barcode === lastScannedBarcode && (now - lastScanTime) < 1500) {
             console.log(`[Smart Control] Дабл-скан: ${barcode}. Запуск отмены...`);
             if (item) {
                 item.style.outline = '3px solid #ff4d4f';
-                setTimeout(() => { item.style.outline = 'none'; }, 500);
+                setTimeout(() => { if (item) item.style.outline = 'none'; }, 500);
             }
-            openDropdownAndSelect(item || getTargetItem(), 'DOUBLE_SCAN');
+            const success = openDropdownAndSelect(item, 'DOUBLE_SCAN');
+            if (success) {
+                enterBlockUntil = Date.now() + 2000;
+            }
             lastScannedBarcode = '';
         } else {
             lastScannedBarcode = barcode;
@@ -307,14 +425,12 @@
         if (btn) simulateRealClick(btn);
     }
 
-    // Умный выбор причины (и открытие/переоткрытие списка при необходимости)
     function openDropdownAndSelect(targetItem, reasonIndexOrDoubleScan) {
-        if (!targetItem) return;
+        if (!targetItem) return false;
 
         const isDoubleScan = reasonIndexOrDoubleScan === 'DOUBLE_SCAN';
         const reasonIndex = typeof reasonIndexOrDoubleScan === 'number' ? reasonIndexOrDoubleScan : null;
 
-        // Логика клика нужной опции в меню
         const selectFromOpenMenu = () => {
             let targetOption = null;
 
@@ -324,7 +440,7 @@
                     const text = el.textContent.toLowerCase();
                     return text.includes('решени') || text.includes('отказ клиента');
                 });
-                if (!targetOption && options.length > 0) targetOption = options[0]; // Фолбек
+                if (!targetOption && options.length > 0) targetOption = options[0];
             } else {
                 targetOption = document.querySelector(`[data-testid="postingDropDownItemToAnnulate-${reasonIndex}"]`);
             }
@@ -335,30 +451,26 @@
             }
         };
 
-        // 1. Если меню уже открыто - просто выбираем
         if (document.querySelectorAll('[data-testid^="postingDropDownItemToAnnulate"]').length > 0) {
             selectFromOpenMenu();
-            return;
+            return true;
         }
 
-        // 2. Ищем кнопку-стрелку (если нужно открыть или изменить причину)
         let arrowBtn = null;
         const splitBtns = targetItem.querySelectorAll('[class*="splitButton"] button');
 
         if (splitBtns.length >= 2) {
-            arrowBtn = splitBtns[splitBtns.length - 1]; // Обычно вторая кнопка в сплит-группе
+            arrowBtn = splitBtns[splitBtns.length - 1];
         } else {
-            // Если структура изменена, ищем любую кнопку без текста (только иконка), которая не является основной
             const allBtns = Array.from(targetItem.querySelectorAll('button'));
             arrowBtn = allBtns.find(b => b.querySelector('svg') && !b.textContent.trim() && !b.getAttribute('data-testid')?.match(/btnTo(Check|GiveOut|Annulate|Keep)/i));
         }
 
         if (!arrowBtn) {
             console.error("[Smart Control] Не найдена кнопка раскрытия списка.");
-            return;
+            return false;
         }
 
-        // Кликаем и ждем появления DOM
         simulateRealClick(arrowBtn);
 
         let attempts = 0;
@@ -367,9 +479,11 @@
             if (document.querySelectorAll('[data-testid^="postingDropDownItemToAnnulate"]').length > 0) {
                 clearInterval(checkDropdown);
                 selectFromOpenMenu();
-            } else if (attempts > 15) { // Отсечка через ~1.5 сек
+            } else if (attempts > 15) {
                 clearInterval(checkDropdown);
             }
         }, 100);
+
+        return true;
     }
 })();
