@@ -35,10 +35,8 @@
     // Регулярка для определения КИЗ (Честный знак)
     const CIS_PATTERN = /^[^a-zA-Z0-9]*01\d{13,14}21.+$/;
 
-    // Состояние скрипта
     let activePackageIndex = 0;
 
-    // ФОКУС
     let activeBarcode = '';
     let lastScannedBarcode = '';
     let lastScanTime = 0;
@@ -49,7 +47,6 @@
     let scanBuffer = '';
     let lastScanKeyTime = Date.now();
 
-    // Блокировка и анимации
     let enterHoldTimeout = null;
     let isEnterHolding = false;
     let heldButton = null;
@@ -62,12 +59,7 @@
 
     console.log("[Smart Control] Скрипт версии 7.6 запущен.");
 
-    // --------------------------------------------------------
-    // 0. ВНЕДРЕНИЕ НАБЛЮДАТЕЛЯ (MUTATION OBSERVER) И CSS
-    // --------------------------------------------------------
     
-    // Наблюдаем за страницей. Как только Ozon окрашивает любую карточку в зеленый (_success_),
-    // мы мгновенно сохраняем ее как цель для фокуса. Это единственный способ связать КИЗ с товаром!
     const observer = new MutationObserver((mutations) => {
         for (let m of mutations) {
             if (m.type === 'attributes' && m.attributeName === 'class') {
@@ -111,9 +103,6 @@
     `;
     document.head.appendChild(style);
 
-    // --------------------------------------------------------
-    // 1. АВТОМАТИЧЕСКАЯ ОТРИСОВКА И ПРИВЯЗКА ПРИЧИН
-    // --------------------------------------------------------
     setInterval(() => {
         highlightActivePackage();
         injectReasonNumbers();
@@ -186,9 +175,6 @@
         });
     }
 
-    // --------------------------------------------------------
-    // 2. ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ФОКУСА И ЗВУКА
-    // --------------------------------------------------------
     function initAudio() {
         if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
         if (audioCtx.state === 'suspended') audioCtx.resume();
@@ -214,7 +200,6 @@
             osc.stop(start + 0.2);
         };
         
-        // Воспроизводим сразу два конфликтующих звука для эффекта "сирены/ошибки"
         playNote(t, 400);
         playNote(t, 420);
         playNote(t + 0.15, 300);
@@ -245,15 +230,12 @@
     function getTargetItem() {
         let item = null;
         
-        // 1. Поиск по тексту (отлично работает для обычных отправлений)
         if (activeBarcode) item = findItemByBarcode(activeBarcode);
 
-        // 2. Если это КИЗ, текст мы не найдем. Подхватываем карточку, которую Ozon ПОСЛЕДНЕЙ окрасил в зеленый
         if (!item && lastSuccessCard && document.body.contains(lastSuccessCard)) {
             item = lastSuccessCard;
         }
 
-        // 3. Фолбек
         if (!item) {
             const successCards = document.querySelectorAll('[class*="_success_"]');
             if (successCards.length > 0) item = successCards[successCards.length - 1].closest('[class*="_card_"]');
@@ -294,9 +276,6 @@
         });
     }
 
-    // --------------------------------------------------------
-    // 3. ГЛОБАЛЬНЫЙ ОБРАБОТЧИК КЛАВИШ И МЫШИ
-    // --------------------------------------------------------
     window.addEventListener('mousedown', function(e) {
         const card = e.target.closest('[class*="_card_"], [class*="_item_"]');
         if (card) {
@@ -366,7 +345,6 @@
             return;
         }
 
-        // --- АННУЛЯЦИЯ (Num 1-5) ---
         if (REASON_KEYS.includes(e.code)) {
             e.preventDefault(); e.stopPropagation();
             const requestedNum = REASON_KEYS.indexOf(e.code) + 1;
@@ -380,7 +358,6 @@
             return;
         }
 
-        // --- Numpad Enter ---
         if (e.code === KEY_ENTER) {
             e.preventDefault(); e.stopPropagation();
 
@@ -434,9 +411,6 @@
         }
     }, true);
 
-    // --------------------------------------------------------
-    // 4. СЛУЖЕБНЫЕ СКРИПТОВЫЕ ФУНКЦИИ
-    // --------------------------------------------------------
     function adjustPackage(action) {
         const counters = document.querySelectorAll('[class*="input-count__group"]');
         if (counters.length <= activePackageIndex) return;
