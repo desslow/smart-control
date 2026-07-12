@@ -1,11 +1,10 @@
 // ==UserScript==
 // @name         Ozon Smart Control (by desslow)
 // @namespace    http://tampermonkey.net/
-// @version      7.4
-// @description  Клавиатурный режим. Фикс анимаций кнопок, умная фиксация причин на Numpad, поддержка любых КИЗ ШК, громкий сигнал ошибки.
-// @author       desslow & AI Assistant
+// @version      7.5
+// @description  Клавиатурный режим выдачи заказов клиентам.
+// @author       desslow
 // @match        https://*.ozon.ru/*
-// @match        https://*.ozon.work/*
 // @grant        none
 // ==/UserScript==
 
@@ -21,10 +20,22 @@
 
     const REASON_KEYS = ['Numpad1', 'Numpad2', 'Numpad3', 'Numpad4', 'Numpad5'];
 
+    // Карта транслитерации (если сканер шлет ШК на русской раскладке)
+    const RUS_TO_ENG = {
+        'й': 'q', 'ц': 'w', 'у': 'e', 'к': 'r', 'е': 't', 'н': 'y', 'г': 'u', 'ш': 'i', 'щ': 'o', 'з': 'p',
+        'х': '[', 'ъ': ']', 'ф': 'a', 'ы': 's', 'в': 'd', 'а': 'f', 'п': 'g', 'р': 'h', 'о': 'j', 'л': 'k',
+        'д': 'l', 'ж': ';', 'э': "'", 'я': 'z', 'ч': 'x', 'с': 'c', 'м': 'v', 'и': 'b', 'т': 'n', 'ь': 'm',
+        'б': ',', 'ю': '.', '.': '/', 'Ё': '~', 'ё': '`',
+        'Й': 'Q', 'Ц': 'W', 'У': 'E', 'К': 'R', 'Е': 'T', 'Н': 'Y', 'Г': 'U', 'Ш': 'I', 'Щ': 'O', 'З': 'P',
+        'Х': '{', 'Ъ': '}', 'Ф': 'A', 'Ы': 'S', 'В': 'D', 'А': 'F', 'П': 'G', 'Р': 'H', 'О': 'J', 'Л': 'K',
+        'Д': 'L', 'Ж': ':', 'Э': '"', 'Я': 'Z', 'Ч': 'X', 'С': 'C', 'М': 'V', 'И': 'B', 'Т': 'N', 'Ь': 'M',
+        'Б': '<', 'Ю': '>', ',': '?'
+    };
+
     // Состояние скрипта
     let activePackageIndex = 0;
 
-    // ФОКУС: Храним строку ШК для динамического переключения
+    // ФОКУС
     let activeBarcode = '';
     let lastScannedBarcode = '';
     let lastScanTime = 0;
@@ -36,27 +47,20 @@
     let enterHoldTimeout = null;
     let isEnterHolding = false;
     let heldButton = null;
-    let enterBlockUntil = 0; // Время блокировки Enter после аннуляции
+    let enterBlockUntil = 0;
 
-    // Таймер для дабл-тапа 0
     let numpad0Presses = 0;
     let numpad0Timer = null;
 
-    // Звук
     let audioCtx = null;
 
-    // Закрепление причин аннуляции за кнопками
-    const reasonNumMap = new Map();
-    let availableNums = [1, 2, 3, 4, 5, 6, 7, 8, 9];
-
-    console.log("[Smart Control] Скрипт версии 7.4 запущен.");
+    console.log("[Smart Control] Запущен (v7.5)");
 
     // --------------------------------------------------------
-    // 0. ВНЕДРЕНИЕ CSS ДЛЯ АНИМАЦИИ И ФОКУСА
+    // 0. CSS ДЛЯ АНИМАЦИИ И ФОКУСА
     // --------------------------------------------------------
     const style = document.createElement('style');
     style.innerHTML = `
-        /* Визуальный фокус выбранного товара */
         .smart-control-focus {
             outline: 3px solid #ff9800 !important;
             outline-offset: -2px !important;
@@ -64,7 +68,6 @@
             border-radius: 8px;
             transition: outline 0.2s, box-shadow 0.2s;
         }
-        /* Умная прозрачная анимация без поломки верстки Ozon */
         .smart-btn-progress {
             position: relative !important;
             overflow: hidden !important;
@@ -74,20 +77,20 @@
             position: absolute;
             top: 0; left: 0; bottom: 0;
             width: var(--smart-progress, 0%);
-            background-color: rgba(228, 0, 124, 0.5) !important; /* Полупрозрачный Mexican Pink */
+            background-color: rgba(228, 0, 124, 0.5) !important;
             transition: width 0.4s linear, opacity 0.2s ease-out;
             pointer-events: none;
             z-index: 10;
-            border-radius: inherit; /* Наследует закругления кнопки */
+            border-radius: inherit;
         }
         .smart-btn-progress.done::after {
-            opacity: 0; /* Плавно гасим при 100%, чтобы не конфликтовать с лоадером Ozon */
+            opacity: 0;
         }
     `;
     document.head.appendChild(style);
 
     // --------------------------------------------------------
-    // 1. АВТОМАТИЧЕСКАЯ ОТРИСОВКА ИНТЕРФЕЙСА И ПРИВЯЗКА ПРИЧИН
+    // 1. АВТОМАТИЧЕСКАЯ ОТРИСОВКА И ПРИВЯЗКА ПРИЧИН
     // --------------------------------------------------------
     setInterval(() => {
         highlightActivePackage();
@@ -95,80 +98,88 @@
         maintainFocusVisual();
     }, 200);
 
-    function getReasonAssignedNumber(element) {
-        let text = element.textContent || '';
-        text = text.replace(/\[Num \d+\]/g, '').trim().toLowerCase(); // Очищаем от наших же бейджей
-        if (!text) return null;
-
-        if (reasonNumMap.has(text)) return reasonNumMap.get(text);
-
-        // Умное распределение по ключевым словам
-        let preferred = null;
-        if (text.includes('клиент') || text.includes('отказ') || text.includes('решени')) preferred = 1;
-        else if (text.includes('брак') || text.includes('поврежд') || text.includes('разбит')) preferred = 2;
-        else if (text.includes('ошиб') || text.includes('не тот') || text.includes('подмен')) preferred = 3;
-        else if (text.includes('неполн') || text.includes('пуст') || text.includes('част')) preferred = 4;
-
-        if (preferred && availableNums.includes(preferred)) {
-            availableNums = availableNums.filter(n => n !== preferred);
-            reasonNumMap.set(text, preferred);
-            return preferred;
-        }
-
-        // Если не подошло под паттерны — берем просто следующую свободную цифру
-        const num = availableNums.shift();
-        if (num) reasonNumMap.set(text, num);
-        return num;
-    }
-
     function injectReasonNumbers() {
         const dropdownItems = document.querySelectorAll('[data-testid^="postingDropDownItemToAnnulate"]');
-        dropdownItems.forEach(dropdownItem => {
-            const labelContainer = dropdownItem.querySelector('[class*="data-content__label"]') || dropdownItem;
-            if (!labelContainer || labelContainer.querySelector('.numpad-badge-helper')) return;
+        if (dropdownItems.length === 0) return;
 
-            const num = getReasonAssignedNumber(labelContainer);
-            if (!num) return;
+        const usedNums = new Set();
 
-            const badge = document.createElement('span');
-            badge.className = 'numpad-badge-helper';
-            badge.dataset.reasonNum = num; // Записываем жестко назначенную цифру
-            badge.style.marginLeft = '12px';
-            badge.style.padding = '2px 6px';
-            badge.style.background = '#e4e6e9';
-            badge.style.color = '#4e5b6c';
-            badge.style.border = '1px solid #cbced4';
-            badge.style.borderRadius = '4px';
-            badge.style.fontSize = '11px';
-            badge.style.fontWeight = 'bold';
-            badge.style.fontFamily = 'monospace';
-            badge.style.display = 'inline-block';
-            badge.style.boxShadow = '0 1px 0 rgba(0,0,0,0.15)';
-            badge.textContent = `[Num ${num}]`;
+        dropdownItems.forEach(item => {
+            const labelContainer = item.querySelector('[class*="data-content__label"]') || item;
 
-            labelContainer.appendChild(badge);
+            const existingBadge = labelContainer.querySelector('.numpad-badge-helper');
+            if (existingBadge) {
+                usedNums.add(parseInt(existingBadge.dataset.reasonNum, 10));
+                return;
+            }
+
+            let text = labelContainer.textContent.toLowerCase();
+            let num = null;
+
+            if (text.includes('брак') || text.includes('поврежд') || text.includes('разбит') || text.includes('дефект')) num = 1;
+            else if (text.includes('ошиб') || text.includes('не тот') || text.includes('подмен') || text.includes('пересорт')) num = 2;
+            else if (text.includes('неполн') || text.includes('пуст') || text.includes('част') || text.includes('вскрыт')) num = 3;
+            else if (text.includes('решени') || text.includes('отказ') || text.includes('клиент') || text.includes('передумал')) num = 4;
+            else if (text.includes('срок') || text.includes('просроч') || text.includes('проч') || text.includes('опозд')) num = 5;
+
+            if (num) {
+                item.dataset.fixedNum = num;
+                usedNums.add(num);
+            }
+        });
+
+        dropdownItems.forEach(item => {
+            const labelContainer = item.querySelector('[class*="data-content__label"]') || item;
+            if (labelContainer.querySelector('.numpad-badge-helper')) return;
+
+            let num = item.dataset.fixedNum;
+            if (!num) {
+                for (let i = 1; i <= 9; i++) {
+                    if (!usedNums.has(i)) {
+                        num = i;
+                        usedNums.add(i);
+                        break;
+                    }
+                }
+            }
+
+            if (num) {
+                const badge = document.createElement('span');
+                badge.className = 'numpad-badge-helper';
+                badge.dataset.reasonNum = num;
+                badge.style.marginLeft = '12px';
+                badge.style.padding = '2px 6px';
+                badge.style.background = '#e4e6e9';
+                badge.style.color = '#4e5b6c';
+                badge.style.border = '1px solid #cbced4';
+                badge.style.borderRadius = '4px';
+                badge.style.fontSize = '11px';
+                badge.style.fontWeight = 'bold';
+                badge.style.fontFamily = 'monospace';
+                badge.style.display = 'inline-block';
+                badge.style.boxShadow = '0 1px 0 rgba(0,0,0,0.15)';
+                badge.textContent = `[Num ${num}]`;
+
+                labelContainer.appendChild(badge);
+            }
         });
     }
 
-    // --------------------------------------------------------
-    // 2. ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ФОКУСА И ЗВУКА
-    // --------------------------------------------------------
     function initAudio() {
         if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
         if (audioCtx.state === 'suspended') audioCtx.resume();
     }
 
-    // Очень громкий двойной сигнал
     function playAnnulateAlert() {
         initAudio();
         const t = audioCtx.currentTime;
         const playNote = (start, freq) => {
             const osc = audioCtx.createOscillator();
             const gain = audioCtx.createGain();
-            osc.type = 'sawtooth'; // Резкий пилообразный звук
+            osc.type = 'sawtooth';
             osc.frequency.setValueAtTime(freq, start);
             osc.frequency.exponentialRampToValueAtTime(freq / 2, start + 0.15);
-            gain.gain.setValueAtTime(0.8, start); // Громкость 80% (очень громко!)
+            gain.gain.setValueAtTime(0.8, start); // Громкость 80%
             gain.gain.exponentialRampToValueAtTime(0.01, start + 0.15);
             osc.connect(gain);
             gain.connect(audioCtx.destination);
@@ -245,9 +256,6 @@
         });
     }
 
-    // --------------------------------------------------------
-    // 3. ГЛОБАЛЬНЫЙ ОБРАБОТЧИК КЛАВИШ И МЫШИ
-    // --------------------------------------------------------
     window.addEventListener('mousedown', function(e) {
         const card = e.target.closest('[class*="_card_"], [class*="_item_"]');
         if (card) {
@@ -282,9 +290,10 @@
             return;
         }
 
-        // Фикс №2: Разрешаем сканеру вводить ВСЕ печатаемые символы, включая скобки, +, =, # и т.д.
+        // АВТОТРАНСЛИТ: если приходит русский символ, переводим в английский
         if (e.key.length === 1 && !e.ctrlKey && !e.altKey && !e.metaKey) {
-            scanBuffer += e.key;
+            const mappedChar = RUS_TO_ENG[e.key] || e.key;
+            scanBuffer += mappedChar;
         }
 
         if (isInputActive() && e.code !== KEY_ENTER) return;
@@ -315,10 +324,8 @@
             return;
         }
 
-        // --- АННУЛЯЦИЯ (Num 1-5) ---
         if (REASON_KEYS.includes(e.code)) {
             e.preventDefault(); e.stopPropagation();
-            // Получаем цифру, которую нажал пользователь (1, 2, 3, 4 или 5)
             const requestedNum = REASON_KEYS.indexOf(e.code) + 1;
             const target = getTargetItem();
             if (target) {
@@ -339,7 +346,6 @@
             const mainBtn = findMainActionButton();
             if (!mainBtn) return;
 
-            // Блокировка мисскликов 
             if (Date.now() < enterBlockUntil) {
                 console.log("[Smart Control] Нажатие Enter заблокировано после выбора аннуляции!");
                 playAnnulateAlert();
@@ -351,18 +357,17 @@
 
             const btnText = mainBtn.textContent.trim();
 
-            // Прогресс-бар без смещения макета кнопки (Фикс №1)
             if (btnText === 'Провести оплату' || btnText === 'Попробовать ещё') {
                 isEnterHolding = true;
                 heldButton = mainBtn;
 
                 heldButton.classList.add('smart-btn-progress');
-                heldButton.classList.remove('done'); // Сброс, если осталось с прошлого раза
+                heldButton.classList.remove('done');
                 void heldButton.offsetWidth; // Reflow
                 heldButton.style.setProperty('--smart-progress', '100%');
 
                 enterHoldTimeout = setTimeout(() => {
-                    heldButton.classList.add('done'); // Прячем розовый фон перед кликом
+                    heldButton.classList.add('done');
                     simulateRealClick(heldButton);
                     isEnterHolding = false;
                     heldButton = null;
@@ -386,9 +391,6 @@
         }
     }, true);
 
-    // --------------------------------------------------------
-    // 4. СЛУЖЕБНЫЕ СКРИПТОВЫЕ ФУНКЦИИ
-    // --------------------------------------------------------
     function adjustPackage(action) {
         const counters = document.querySelectorAll('[class*="input-count__group"]');
         if (counters.length <= activePackageIndex) return;
@@ -420,9 +422,7 @@
                 setTimeout(() => { if (item) item.style.outline = 'none'; }, 500);
             }
             const success = openDropdownAndSelect(item, 'DOUBLE_SCAN');
-            if (success) {
-                enterBlockUntil = Date.now() + 2000;
-            }
+            if (success) enterBlockUntil = Date.now() + 2000;
             lastScannedBarcode = '';
         } else {
             lastScannedBarcode = barcode;
@@ -448,11 +448,10 @@
             let targetOption = null;
 
             if (isDoubleScan) {
-                // Ищем отказ клиента (он у нас зарезервирован под номером 1)
-                const badge = document.querySelector('.numpad-badge-helper[data-reason-num="1"]');
+                // Ищем отказ клиента (он у нас жестко закреплен за Num 4)
+                const badge = document.querySelector('.numpad-badge-helper[data-reason-num="4"]');
                 if (badge) targetOption = badge.closest('[data-testid^="postingDropDownItemToAnnulate"]');
-                
-                // Фолбек
+
                 if (!targetOption) {
                     const options = Array.from(document.querySelectorAll('[data-testid^="postingDropDownItemToAnnulate"]'));
                     targetOption = options.find(el => {
@@ -461,13 +460,12 @@
                     }) || options[0];
                 }
             } else {
-                // Ищем по нашей четко закрепленной цифре (Фикс №3)
                 const badge = document.querySelector(`.numpad-badge-helper[data-reason-num="${requestedNum}"]`);
                 if (badge) {
                     targetOption = badge.closest('[data-testid^="postingDropDownItemToAnnulate"]');
                 } else {
-                    // Фолбек на индекс Озона, если что-то пошло не так
-                    targetOption = document.querySelector(`[data-testid="postingDropDownItemToAnnulate-${requestedNum - 1}"]`);
+                    const options = Array.from(document.querySelectorAll('[data-testid^="postingDropDownItemToAnnulate"]'));
+                    if (options[requestedNum - 1]) targetOption = options[requestedNum - 1];
                 }
             }
 
@@ -494,7 +492,7 @@
         }
 
         if (!arrowBtn) {
-            console.error("[Smart Control] Не найдена кнопка раскрытия списка.");
+            console.warn("[Smart Control] Не найдена кнопка раскрытия списка.");
             return false;
         }
 
@@ -505,7 +503,7 @@
             attempts++;
             if (document.querySelectorAll('[data-testid^="postingDropDownItemToAnnulate"]').length > 0) {
                 clearInterval(checkDropdown);
-                injectReasonNumbers(); // Принудительно размечаем список перед кликом
+                injectReasonNumbers();
                 selectFromOpenMenu();
             } else if (attempts > 15) {
                 clearInterval(checkDropdown);
