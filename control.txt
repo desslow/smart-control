@@ -1,9 +1,9 @@
 // ==UserScript==
 // @name         Ozon Smart Control (by desslow)
 // @namespace    http://tampermonkey.net/
-// @version      7.3
-// @description  Замена ручной выдачи товаров клиентам на клавиатурный режим.
-// @author       desslow
+// @version      7.4
+// @description  Клавиатурный режим. Фикс анимаций кнопок, умная фиксация причин на Numpad, поддержка любых КИЗ ШК, громкий сигнал ошибки.
+// @author       desslow & AI Assistant
 // @match        https://*.ozon.ru/*
 // @match        https://*.ozon.work/*
 // @grant        none
@@ -45,7 +45,11 @@
     // Звук
     let audioCtx = null;
 
-    console.log("[Smart Control] Скрипт версии 7.3 запущен. Умный динамический фокус активен.");
+    // Закрепление причин аннуляции за кнопками
+    const reasonNumMap = new Map();
+    let availableNums = [1, 2, 3, 4, 5, 6, 7, 8, 9];
+
+    console.log("[Smart Control] Скрипт версии 7.4 запущен.");
 
     // --------------------------------------------------------
     // 0. ВНЕДРЕНИЕ CSS ДЛЯ АНИМАЦИИ И ФОКУСА
@@ -60,36 +64,157 @@
             border-radius: 8px;
             transition: outline 0.2s, box-shadow 0.2s;
         }
-        /* Умная анимация прогресс-бара */
+        /* Умная прозрачная анимация без поломки верстки Ozon */
         .smart-btn-progress {
-            position: relative;
-            overflow: hidden;
-            border: none !important;
+            position: relative !important;
+            overflow: hidden !important;
         }
-        .smart-btn-progress::before {
+        .smart-btn-progress::after {
             content: '';
             position: absolute;
-            top: 0; left: 0; height: 100%;
+            top: 0; left: 0; bottom: 0;
             width: var(--smart-progress, 0%);
-            background-color: #e4007c !important; /* Mexican Pink */
-            transition: width 0.4s linear;
-            z-index: 0;
+            background-color: rgba(228, 0, 124, 0.5) !important; /* Полупрозрачный Mexican Pink */
+            transition: width 0.4s linear, opacity 0.2s ease-out;
+            pointer-events: none;
+            z-index: 10;
+            border-radius: inherit; /* Наследует закругления кнопки */
         }
-        .smart-btn-progress > div {
-            position: relative;
-            z-index: 1;
+        .smart-btn-progress.done::after {
+            opacity: 0; /* Плавно гасим при 100%, чтобы не конфликтовать с лоадером Ozon */
         }
     `;
     document.head.appendChild(style);
 
     // --------------------------------------------------------
-    // 1. АВТОМАТИЧЕСКАЯ ОТРИСОВКА ИНТЕРФЕЙСА
+    // 1. АВТОМАТИЧЕСКАЯ ОТРИСОВКА ИНТЕРФЕЙСА И ПРИВЯЗКА ПРИЧИН
     // --------------------------------------------------------
     setInterval(() => {
         highlightActivePackage();
         injectReasonNumbers();
         maintainFocusVisual();
     }, 200);
+
+    function getReasonAssignedNumber(element) {
+        let text = element.textContent || '';
+        text = text.replace(/\[Num \d+\]/g, '').trim().toLowerCase(); // Очищаем от наших же бейджей
+        if (!text) return null;
+
+        if (reasonNumMap.has(text)) return reasonNumMap.get(text);
+
+        // Умное распределение по ключевым словам
+        let preferred = null;
+        if (text.includes('клиент') || text.includes('отказ') || text.includes('решени')) preferred = 1;
+        else if (text.includes('брак') || text.includes('поврежд') || text.includes('разбит')) preferred = 2;
+        else if (text.includes('ошиб') || text.includes('не тот') || text.includes('подмен')) preferred = 3;
+        else if (text.includes('неполн') || text.includes('пуст') || text.includes('част')) preferred = 4;
+
+        if (preferred && availableNums.includes(preferred)) {
+            availableNums = availableNums.filter(n => n !== preferred);
+            reasonNumMap.set(text, preferred);
+            return preferred;
+        }
+
+        // Если не подошло под паттерны — берем просто следующую свободную цифру
+        const num = availableNums.shift();
+        if (num) reasonNumMap.set(text, num);
+        return num;
+    }
+
+    function injectReasonNumbers() {
+        const dropdownItems = document.querySelectorAll('[data-testid^="postingDropDownItemToAnnulate"]');
+        dropdownItems.forEach(dropdownItem => {
+            const labelContainer = dropdownItem.querySelector('[class*="data-content__label"]') || dropdownItem;
+            if (!labelContainer || labelContainer.querySelector('.numpad-badge-helper')) return;
+
+            const num = getReasonAssignedNumber(labelContainer);
+            if (!num) return;
+
+            const badge = document.createElement('span');
+            badge.className = 'numpad-badge-helper';
+            badge.dataset.reasonNum = num; // Записываем жестко назначенную цифру
+            badge.style.marginLeft = '12px';
+            badge.style.padding = '2px 6px';
+            badge.style.background = '#e4e6e9';
+            badge.style.color = '#4e5b6c';
+            badge.style.border = '1px solid #cbced4';
+            badge.style.borderRadius = '4px';
+            badge.style.fontSize = '11px';
+            badge.style.fontWeight = 'bold';
+            badge.style.fontFamily = 'monospace';
+            badge.style.display = 'inline-block';
+            badge.style.boxShadow = '0 1px 0 rgba(0,0,0,0.15)';
+            badge.textContent = `[Num ${num}]`;
+
+            labelContainer.appendChild(badge);
+        });
+    }
+
+    // --------------------------------------------------------
+    // 2. ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ФОКУСА И ЗВУКА
+    // --------------------------------------------------------
+    function initAudio() {
+        if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+        if (audioCtx.state === 'suspended') audioCtx.resume();
+    }
+
+    // Очень громкий двойной сигнал
+    function playAnnulateAlert() {
+        initAudio();
+        const t = audioCtx.currentTime;
+        const playNote = (start, freq) => {
+            const osc = audioCtx.createOscillator();
+            const gain = audioCtx.createGain();
+            osc.type = 'sawtooth'; // Резкий пилообразный звук
+            osc.frequency.setValueAtTime(freq, start);
+            osc.frequency.exponentialRampToValueAtTime(freq / 2, start + 0.15);
+            gain.gain.setValueAtTime(0.8, start); // Громкость 80% (очень громко!)
+            gain.gain.exponentialRampToValueAtTime(0.01, start + 0.15);
+            osc.connect(gain);
+            gain.connect(audioCtx.destination);
+            osc.start(start);
+            osc.stop(start + 0.15);
+        };
+        playNote(t, 400);
+        playNote(t + 0.2, 300);
+    }
+
+    function isInputActive() {
+        const el = document.activeElement;
+        return el && (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' || el.isContentEditable);
+    }
+
+    function findItemByBarcode(barcode) {
+        if (!barcode) return null;
+        const lowerBarcode = barcode.trim().toLowerCase();
+
+        const textareas = document.querySelectorAll('textarea[aria-hidden="true"], input[type="text"], input[type="hidden"]');
+        for (let el of textareas) {
+            const val = el.value || el.getAttribute('value') || el.textContent;
+            if (val && val.trim().toLowerCase() === lowerBarcode) {
+                return el.closest('[class*="_card_"], [class*="_item_"]') || el.parentElement;
+            }
+        }
+
+        const direct = document.querySelector(`[data-testid*="${barcode}"]`);
+        return direct ? (direct.closest('[class*="_card_"], [class*="_item_"]') || direct) : null;
+    }
+
+    function getTargetItem() {
+        let item = null;
+        if (activeBarcode) item = findItemByBarcode(activeBarcode);
+
+        if (!item) {
+            const successCards = document.querySelectorAll('[class*="_success_"]');
+            if (successCards.length > 0) item = successCards[successCards.length - 1].closest('[class*="_card_"]');
+        }
+
+        if (!item) {
+            const anyBtn = document.querySelector('[data-testid="btnToCheck"], [data-testid="btnToGiveOut"]');
+            if (anyBtn) item = anyBtn.closest('[class*="_card_"]');
+        }
+        return item;
+    }
 
     function highlightActivePackage() {
         const counters = document.querySelectorAll('[class*="input-count__group"]');
@@ -106,39 +231,10 @@
         });
     }
 
-    function injectReasonNumbers() {
-        for (let i = 0; i <= 4; i++) {
-            const dropdownItem = document.querySelector(`[data-testid="postingDropDownItemToAnnulate-${i}"]`);
-            if (!dropdownItem) continue;
-
-            const labelContainer = dropdownItem.querySelector('[class*="data-content__label"]') || dropdownItem;
-            if (!labelContainer || labelContainer.querySelector('.numpad-badge-helper')) continue;
-
-            const badge = document.createElement('span');
-            badge.className = 'numpad-badge-helper';
-            badge.style.marginLeft = '12px';
-            badge.style.padding = '2px 6px';
-            badge.style.background = '#e4e6e9';
-            badge.style.color = '#4e5b6c';
-            badge.style.border = '1px solid #cbced4';
-            badge.style.borderRadius = '4px';
-            badge.style.fontSize = '11px';
-            badge.style.fontWeight = 'bold';
-            badge.style.fontFamily = 'monospace';
-            badge.style.display = 'inline-block';
-            badge.style.boxShadow = '0 1px 0 rgba(0,0,0,0.15)';
-            badge.textContent = `[Num ${i + 1}]`;
-
-            labelContainer.appendChild(badge);
-        }
-    }
-
     function maintainFocusVisual() {
         document.querySelectorAll('.smart-control-focus').forEach(el => el.classList.remove('smart-control-focus'));
         const target = getTargetItem();
-        if (target) {
-            target.classList.add('smart-control-focus');
-        }
+        if (target) target.classList.add('smart-control-focus');
     }
 
     function simulateRealClick(element) {
@@ -150,100 +246,23 @@
     }
 
     // --------------------------------------------------------
-    // 2. ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ФОКУСА И ЗВУКА
-    // --------------------------------------------------------
-    function initAudio() {
-        if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-        if (audioCtx.state === 'suspended') audioCtx.resume();
-    }
-
-    function playAnnulateAlert() {
-        initAudio();
-        const oscillator = audioCtx.createOscillator();
-        const gainNode = audioCtx.createGain();
-        oscillator.type = 'square';
-        oscillator.frequency.setValueAtTime(200, audioCtx.currentTime);
-        oscillator.frequency.exponentialRampToValueAtTime(100, audioCtx.currentTime + 0.2);
-        gainNode.gain.setValueAtTime(0.05, audioCtx.currentTime);
-        gainNode.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + 0.2);
-        oscillator.connect(gainNode);
-        gainNode.connect(audioCtx.destination);
-        oscillator.start();
-        oscillator.stop(audioCtx.currentTime + 0.2);
-    }
-
-    function isInputActive() {
-        const el = document.activeElement;
-        return el && (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' || el.isContentEditable);
-    }
-
-    function findItemByBarcode(barcode) {
-        if (!barcode) return null;
-        const lowerBarcode = barcode.trim().toLowerCase();
-
-        // Поиск по скрытым textarea и полям ввода (стандартное хранение Ozon)
-        const textareas = document.querySelectorAll('textarea[aria-hidden="true"], input[type="text"], input[type="hidden"]');
-        for (let el of textareas) {
-            const val = el.value || el.getAttribute('value') || el.textContent;
-            if (val && val.trim().toLowerCase() === lowerBarcode) {
-                return el.closest('[class*="_card_"], [class*="_item_"]') || el.parentElement;
-            }
-        }
-
-        // Резервный поиск по data-testid (точное совпадение или частичное)
-        const direct = document.querySelector(`[data-testid*="${barcode}"]`);
-        return direct ? (direct.closest('[class*="_card_"], [class*="_item_"]') || direct) : null;
-    }
-
-    function getTargetItem() {
-        let item = null;
-
-        // 1. Ищем по явному фокусу (ШК от сканера или клика)
-        if (activeBarcode) {
-            item = findItemByBarcode(activeBarcode);
-        }
-
-        // 2. Если нет явного фокуса — ищем зелёную карточку (_success_)
-        if (!item) {
-            const successCards = document.querySelectorAll('[class*="_success_"]');
-            if (successCards.length > 0) {
-                item = successCards[successCards.length - 1].closest('[class*="_card_"]');
-            }
-        }
-
-        // 3. Фолбек: берем просто первый товар в списке
-        if (!item) {
-            const anyBtn = document.querySelector('[data-testid="btnToCheck"], [data-testid="btnToGiveOut"]');
-            if (anyBtn) item = anyBtn.closest('[class*="_card_"]');
-        }
-
-        return item;
-    }
-
-    // --------------------------------------------------------
     // 3. ГЛОБАЛЬНЫЙ ОБРАБОТЧИК КЛАВИШ И МЫШИ
     // --------------------------------------------------------
-
-    // Отслеживаем ручной клик по карточке, чтобы перенести на нее фокус
     window.addEventListener('mousedown', function(e) {
         const card = e.target.closest('[class*="_card_"], [class*="_item_"]');
         if (card) {
             const ta = card.querySelector('textarea[aria-hidden="true"], input[type="text"]');
-            if (ta) {
-                activeBarcode = ta.value || ta.getAttribute('value') || ta.textContent;
-            }
+            if (ta) activeBarcode = ta.value || ta.getAttribute('value') || ta.textContent;
         }
     }, true);
 
     window.addEventListener('keydown', function(e) {
         const now = Date.now();
-        // Увеличен таймаут до 400 мс для корректной работы со всеми сканерами
         if (now - lastScanKeyTime > 400) scanBuffer = '';
         lastScanKeyTime = now;
 
         if (e.isTrusted && !audioCtx) initAudio();
 
-        // --- КНОПКА ВОЗВРАТА (Esc) ---
         if (e.key === 'Escape') {
             const backSvgPath = document.querySelector('path[d^="M6.293 2.293"]');
             if (backSvgPath) {
@@ -256,21 +275,18 @@
             return;
         }
 
-        // --- Обработка сканирования ШК ---
         if (e.key === 'Enter' && e.code !== KEY_ENTER) {
             const barcode = scanBuffer.trim();
             scanBuffer = '';
-            // Снижено ограничение длины, чтобы ловить все возможные форматы
-            if (barcode.length >= 6) handleBarcodeScan(barcode);
+            if (barcode.length >= 5) handleBarcodeScan(barcode);
             return;
         }
 
-        // ИСПРАВЛЕНИЕ: Разрешены не только цифры, но и латиница + тире + слэши
-        if (e.key.length === 1 && /^[a-zA-Z0-9\-\/]+$/.test(e.key)) {
+        // Фикс №2: Разрешаем сканеру вводить ВСЕ печатаемые символы, включая скобки, +, =, # и т.д.
+        if (e.key.length === 1 && !e.ctrlKey && !e.altKey && !e.metaKey) {
             scanBuffer += e.key;
         }
 
-        // --- NUMPAD ---
         if (isInputActive() && e.code !== KEY_ENTER) return;
 
         if (e.code === KEY_MULTIPLY) {
@@ -302,13 +318,12 @@
         // --- АННУЛЯЦИЯ (Num 1-5) ---
         if (REASON_KEYS.includes(e.code)) {
             e.preventDefault(); e.stopPropagation();
-            const reasonIndex = REASON_KEYS.indexOf(e.code);
+            // Получаем цифру, которую нажал пользователь (1, 2, 3, 4 или 5)
+            const requestedNum = REASON_KEYS.indexOf(e.code) + 1;
             const target = getTargetItem();
             if (target) {
-                const success = openDropdownAndSelect(target, reasonIndex);
-                if (success) {
-                    enterBlockUntil = Date.now() + 2000; // Блокируем Enter (БЕЗ ЗВУКА здесь)
-                }
+                const success = openDropdownAndSelect(target, requestedNum);
+                if (success) enterBlockUntil = Date.now() + 2000;
             } else {
                 console.warn("[Smart Control] Нет товара для аннуляции");
             }
@@ -324,7 +339,7 @@
             const mainBtn = findMainActionButton();
             if (!mainBtn) return;
 
-            // Блокировка мисскликов (ЗВУК ВОСПРОИЗВОДИТСЯ ТОЛЬКО ПРИ ОШИБКЕ)
+            // Блокировка мисскликов 
             if (Date.now() < enterBlockUntil) {
                 console.log("[Smart Control] Нажатие Enter заблокировано после выбора аннуляции!");
                 playAnnulateAlert();
@@ -336,16 +351,18 @@
 
             const btnText = mainBtn.textContent.trim();
 
+            // Прогресс-бар без смещения макета кнопки (Фикс №1)
             if (btnText === 'Провести оплату' || btnText === 'Попробовать ещё') {
                 isEnterHolding = true;
                 heldButton = mainBtn;
 
                 heldButton.classList.add('smart-btn-progress');
+                heldButton.classList.remove('done'); // Сброс, если осталось с прошлого раза
                 void heldButton.offsetWidth; // Reflow
                 heldButton.style.setProperty('--smart-progress', '100%');
-                heldButton.style.color = '#fff';
 
                 enterHoldTimeout = setTimeout(() => {
+                    heldButton.classList.add('done'); // Прячем розовый фон перед кликом
                     simulateRealClick(heldButton);
                     isEnterHolding = false;
                     heldButton = null;
@@ -356,16 +373,12 @@
         }
     }, true);
 
-    // Сброс при отпускании Enter
     window.addEventListener('keyup', function(e) {
         if (e.code === KEY_ENTER) {
             if (isEnterHolding) {
                 clearTimeout(enterHoldTimeout);
                 if (heldButton) {
                     heldButton.style.setProperty('--smart-progress', '0%');
-                    setTimeout(() => {
-                        if (heldButton) heldButton.style.color = '';
-                    }, 400);
                 }
                 isEnterHolding = false;
                 heldButton = null;
@@ -397,7 +410,7 @@
 
     function handleBarcodeScan(barcode) {
         const now = Date.now();
-        activeBarcode = barcode; // Жёстко фокусируемся на скане
+        activeBarcode = barcode;
         const item = getTargetItem();
 
         if (barcode === lastScannedBarcode && (now - lastScanTime) < 1500) {
@@ -425,24 +438,37 @@
         if (btn) simulateRealClick(btn);
     }
 
-    function openDropdownAndSelect(targetItem, reasonIndexOrDoubleScan) {
+    function openDropdownAndSelect(targetItem, requestedNumOrDoubleScan) {
         if (!targetItem) return false;
 
-        const isDoubleScan = reasonIndexOrDoubleScan === 'DOUBLE_SCAN';
-        const reasonIndex = typeof reasonIndexOrDoubleScan === 'number' ? reasonIndexOrDoubleScan : null;
+        const isDoubleScan = requestedNumOrDoubleScan === 'DOUBLE_SCAN';
+        const requestedNum = typeof requestedNumOrDoubleScan === 'number' ? requestedNumOrDoubleScan : null;
 
         const selectFromOpenMenu = () => {
             let targetOption = null;
 
             if (isDoubleScan) {
-                const options = Array.from(document.querySelectorAll('[data-testid^="postingDropDownItemToAnnulate"]'));
-                targetOption = options.find(el => {
-                    const text = el.textContent.toLowerCase();
-                    return text.includes('решени') || text.includes('отказ клиента');
-                });
-                if (!targetOption && options.length > 0) targetOption = options[0];
+                // Ищем отказ клиента (он у нас зарезервирован под номером 1)
+                const badge = document.querySelector('.numpad-badge-helper[data-reason-num="1"]');
+                if (badge) targetOption = badge.closest('[data-testid^="postingDropDownItemToAnnulate"]');
+                
+                // Фолбек
+                if (!targetOption) {
+                    const options = Array.from(document.querySelectorAll('[data-testid^="postingDropDownItemToAnnulate"]'));
+                    targetOption = options.find(el => {
+                        const text = el.textContent.toLowerCase();
+                        return text.includes('решени') || text.includes('отказ');
+                    }) || options[0];
+                }
             } else {
-                targetOption = document.querySelector(`[data-testid="postingDropDownItemToAnnulate-${reasonIndex}"]`);
+                // Ищем по нашей четко закрепленной цифре (Фикс №3)
+                const badge = document.querySelector(`.numpad-badge-helper[data-reason-num="${requestedNum}"]`);
+                if (badge) {
+                    targetOption = badge.closest('[data-testid^="postingDropDownItemToAnnulate"]');
+                } else {
+                    // Фолбек на индекс Озона, если что-то пошло не так
+                    targetOption = document.querySelector(`[data-testid="postingDropDownItemToAnnulate-${requestedNum - 1}"]`);
+                }
             }
 
             if (targetOption) {
@@ -452,6 +478,7 @@
         };
 
         if (document.querySelectorAll('[data-testid^="postingDropDownItemToAnnulate"]').length > 0) {
+            injectReasonNumbers();
             selectFromOpenMenu();
             return true;
         }
@@ -478,6 +505,7 @@
             attempts++;
             if (document.querySelectorAll('[data-testid^="postingDropDownItemToAnnulate"]').length > 0) {
                 clearInterval(checkDropdown);
+                injectReasonNumbers(); // Принудительно размечаем список перед кликом
                 selectFromOpenMenu();
             } else if (attempts > 15) {
                 clearInterval(checkDropdown);
@@ -486,4 +514,5 @@
 
         return true;
     }
+
 })();
