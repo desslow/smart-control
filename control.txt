@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Ozon Smart Control (by desslow)
 // @namespace    http://tampermonkey.net/
-// @version      7.5
-// @description  Клавиатурный режим выдачи заказов клиентам.
+// @version      7.6
+// @description  Клавиатурный режим выдачи заказов клиентам + навигация.
 // @author       desslow
 // @match        https://*.ozon.ru/*
 // @grant        none
@@ -42,6 +42,7 @@
 
     let scanBuffer = '';
     let lastScanKeyTime = Date.now();
+    let lastLeftCtrlTime = 0; // Для отслеживания двойного нажатия Ctrl
 
     // Блокировка и анимации
     let enterHoldTimeout = null;
@@ -54,7 +55,7 @@
 
     let audioCtx = null;
 
-    console.log("[Smart Control] Запущен (v7.5)");
+    console.log("[Smart Control] Запущен (v7.6)");
 
     // --------------------------------------------------------
     // 0. CSS ДЛЯ АНИМАЦИИ И ФОКУСА
@@ -256,6 +257,25 @@
         });
     }
 
+    function openOrdersMenu() {
+        // Ищем ссылку /orders
+        const ordersLink = document.querySelector('a[href="/orders"]');
+        if (ordersLink) {
+            console.log("[Smart Control] Переход в раздел Заказы (по двойному Ctrl)");
+            // Пытаемся кликнуть по кнопке внутри ссылки, если нет - по самой ссылке
+            const btn = ordersLink.querySelector('button') || ordersLink;
+            simulateRealClick(btn);
+        } else {
+            console.warn("[Smart Control] Кнопка меню '/orders' не найдена.");
+            // Резервный поиск по пути SVG (если вдруг поменяется href)
+            const backupSvg = document.querySelector('path[d^="M18 3a1 1 0 0 1 .895.553l2"]');
+            if (backupSvg) {
+                const btn = backupSvg.closest('button, a');
+                if (btn) simulateRealClick(btn);
+            }
+        }
+    }
+
     window.addEventListener('mousedown', function(e) {
         const card = e.target.closest('[class*="_card_"], [class*="_item_"]');
         if (card) {
@@ -270,6 +290,19 @@
         lastScanKeyTime = now;
 
         if (e.isTrusted && !audioCtx) initAudio();
+
+        // Обработка левого Ctrl (двойное нажатие)
+        if (e.code === 'ControlLeft') {
+            if (now - lastLeftCtrlTime < 400) { // Интервал менее 400мс
+                e.preventDefault();
+                e.stopPropagation();
+                openOrdersMenu();
+                lastLeftCtrlTime = 0; // Сбрасываем, чтобы избежать тройных срабатываний
+                return;
+            }
+            lastLeftCtrlTime = now;
+            // Не делаем return, чтобы стандартные комбинации (Ctrl+C, Ctrl+V) работали нормально
+        }
 
         if (e.key === 'Escape') {
             const backSvgPath = document.querySelector('path[d^="M6.293 2.293"]');
