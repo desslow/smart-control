@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Ozon Smart Control (by desslow)
 // @namespace    http://tampermonkey.net/
-// @version      7.6
+// @version      7.5
 // @description  Клавиатурный режим выдачи заказов клиентам.
 // @author       desslow
 // @match        https://*.ozon.ru/*
@@ -20,7 +20,7 @@
 
     const REASON_KEYS = ['Numpad1', 'Numpad2', 'Numpad3', 'Numpad4', 'Numpad5'];
 
-    // Карта транслитерации 
+    // Карта транслитерации (если сканер шлет ШК на русской раскладке)
     const RUS_TO_ENG = {
         'й': 'q', 'ц': 'w', 'у': 'e', 'к': 'r', 'е': 't', 'н': 'y', 'г': 'u', 'ш': 'i', 'щ': 'o', 'з': 'p',
         'х': '[', 'ъ': ']', 'ф': 'a', 'ы': 's', 'в': 'd', 'а': 'f', 'п': 'g', 'р': 'h', 'о': 'j', 'л': 'k',
@@ -32,47 +32,33 @@
         'Б': '<', 'Ю': '>', ',': '?'
     };
 
-    // Регулярка для определения КИЗ (Честный знак)
-    const CIS_PATTERN = /^[^a-zA-Z0-9]*01\d{13,14}21.+$/;
-
+    // Состояние скрипта
     let activePackageIndex = 0;
 
+    // ФОКУС
     let activeBarcode = '';
     let lastScannedBarcode = '';
     let lastScanTime = 0;
-    
-    // Переменная для хранения карточки, которая ПОСЛЕДНЕЙ стала зеленой (решает проблему КИЗ)
-    let lastSuccessCard = null;
 
     let scanBuffer = '';
     let lastScanKeyTime = Date.now();
 
+    // Блокировка и анимации
     let enterHoldTimeout = null;
     let isEnterHolding = false;
     let heldButton = null;
-    let enterBlockUntil = 0; 
+    let enterBlockUntil = 0;
 
     let numpad0Presses = 0;
     let numpad0Timer = null;
 
     let audioCtx = null;
 
-    console.log("[Smart Control] Скрипт версии 7.6 запущен.");
+    console.log("[Smart Control] Запущен (v7.5)");
 
-    
-    const observer = new MutationObserver((mutations) => {
-        for (let m of mutations) {
-            if (m.type === 'attributes' && m.attributeName === 'class') {
-                const el = m.target;
-                if (el.className && typeof el.className === 'string' && el.className.includes('_success_')) {
-                    const card = el.closest('[class*="_card_"], [class*="_item_"]');
-                    if (card) lastSuccessCard = card;
-                }
-            }
-        }
-    });
-    observer.observe(document.documentElement, { attributes: true, subtree: true, attributeFilter: ['class'] });
-
+    // --------------------------------------------------------
+    // 0. CSS ДЛЯ АНИМАЦИИ И ФОКУСА
+    // --------------------------------------------------------
     const style = document.createElement('style');
     style.innerHTML = `
         .smart-control-focus {
@@ -103,6 +89,9 @@
     `;
     document.head.appendChild(style);
 
+    // --------------------------------------------------------
+    // 1. АВТОМАТИЧЕСКАЯ ОТРИСОВКА И ПРИВЯЗКА ПРИЧИН
+    // --------------------------------------------------------
     setInterval(() => {
         highlightActivePackage();
         injectReasonNumbers();
@@ -117,6 +106,7 @@
 
         dropdownItems.forEach(item => {
             const labelContainer = item.querySelector('[class*="data-content__label"]') || item;
+
             const existingBadge = labelContainer.querySelector('.numpad-badge-helper');
             if (existingBadge) {
                 usedNums.add(parseInt(existingBadge.dataset.reasonNum, 10));
@@ -125,7 +115,7 @@
 
             let text = labelContainer.textContent.toLowerCase();
             let num = null;
-            
+
             if (text.includes('брак') || text.includes('поврежд') || text.includes('разбит') || text.includes('дефект')) num = 1;
             else if (text.includes('ошиб') || text.includes('не тот') || text.includes('подмен') || text.includes('пересорт')) num = 2;
             else if (text.includes('неполн') || text.includes('пуст') || text.includes('част') || text.includes('вскрыт')) num = 3;
@@ -156,7 +146,7 @@
             if (num) {
                 const badge = document.createElement('span');
                 badge.className = 'numpad-badge-helper';
-                badge.dataset.reasonNum = num; 
+                badge.dataset.reasonNum = num;
                 badge.style.marginLeft = '12px';
                 badge.style.padding = '2px 6px';
                 badge.style.background = '#e4e6e9';
@@ -186,24 +176,18 @@
         const playNote = (start, freq) => {
             const osc = audioCtx.createOscillator();
             const gain = audioCtx.createGain();
-            osc.type = 'sawtooth'; 
+            osc.type = 'sawtooth';
             osc.frequency.setValueAtTime(freq, start);
-            osc.frequency.exponentialRampToValueAtTime(freq / 2, start + 0.2);
-            
-            // Уровень громкости 300% (3.0). Вызовет жесткий дисторшн (перегруз), звук будет резким и громким!
-            gain.gain.setValueAtTime(3.0, start); 
-            gain.gain.exponentialRampToValueAtTime(0.01, start + 0.2);
-            
+            osc.frequency.exponentialRampToValueAtTime(freq / 2, start + 0.15);
+            gain.gain.setValueAtTime(0.8, start); // Громкость 80%
+            gain.gain.exponentialRampToValueAtTime(0.01, start + 0.15);
             osc.connect(gain);
             gain.connect(audioCtx.destination);
             osc.start(start);
-            osc.stop(start + 0.2);
+            osc.stop(start + 0.15);
         };
-        
         playNote(t, 400);
-        playNote(t, 420);
-        playNote(t + 0.15, 300);
-        playNote(t + 0.15, 315);
+        playNote(t + 0.2, 300);
     }
 
     function isInputActive() {
@@ -229,17 +213,13 @@
 
     function getTargetItem() {
         let item = null;
-        
         if (activeBarcode) item = findItemByBarcode(activeBarcode);
-
-        if (!item && lastSuccessCard && document.body.contains(lastSuccessCard)) {
-            item = lastSuccessCard;
-        }
 
         if (!item) {
             const successCards = document.querySelectorAll('[class*="_success_"]');
             if (successCards.length > 0) item = successCards[successCards.length - 1].closest('[class*="_card_"]');
         }
+
         if (!item) {
             const anyBtn = document.querySelector('[data-testid="btnToCheck"], [data-testid="btnToGiveOut"]');
             if (anyBtn) item = anyBtn.closest('[class*="_card_"]');
@@ -279,7 +259,6 @@
     window.addEventListener('mousedown', function(e) {
         const card = e.target.closest('[class*="_card_"], [class*="_item_"]');
         if (card) {
-            lastSuccessCard = card; // Обновляем фокус по клику мыши
             const ta = card.querySelector('textarea[aria-hidden="true"], input[type="text"]');
             if (ta) activeBarcode = ta.value || ta.getAttribute('value') || ta.textContent;
         }
@@ -311,7 +290,7 @@
             return;
         }
 
-        // АВТОТРАНСЛИТ
+        // АВТОТРАНСЛИТ: если приходит русский символ, переводим в английский
         if (e.key.length === 1 && !e.ctrlKey && !e.altKey && !e.metaKey) {
             const mappedChar = RUS_TO_ENG[e.key] || e.key;
             scanBuffer += mappedChar;
@@ -358,6 +337,7 @@
             return;
         }
 
+        // --- Numpad Enter ---
         if (e.code === KEY_ENTER) {
             e.preventDefault(); e.stopPropagation();
 
@@ -382,12 +362,12 @@
                 heldButton = mainBtn;
 
                 heldButton.classList.add('smart-btn-progress');
-                heldButton.classList.remove('done'); 
+                heldButton.classList.remove('done');
                 void heldButton.offsetWidth; // Reflow
                 heldButton.style.setProperty('--smart-progress', '100%');
 
                 enterHoldTimeout = setTimeout(() => {
-                    heldButton.classList.add('done'); 
+                    heldButton.classList.add('done');
                     simulateRealClick(heldButton);
                     isEnterHolding = false;
                     heldButton = null;
@@ -433,11 +413,6 @@
     function handleBarcodeScan(barcode) {
         const now = Date.now();
         activeBarcode = barcode;
-        
-        if (CIS_PATTERN.test(barcode)) {
-            console.log(`[Smart Control] Распознан КИЗ: ${barcode}. Ожидаем ответ Ozon...`);
-        }
-
         const item = getTargetItem();
 
         if (barcode === lastScannedBarcode && (now - lastScanTime) < 1500) {
@@ -473,9 +448,10 @@
             let targetOption = null;
 
             if (isDoubleScan) {
+                // Ищем отказ клиента (он у нас жестко закреплен за Num 4)
                 const badge = document.querySelector('.numpad-badge-helper[data-reason-num="4"]');
                 if (badge) targetOption = badge.closest('[data-testid^="postingDropDownItemToAnnulate"]');
-                
+
                 if (!targetOption) {
                     const options = Array.from(document.querySelectorAll('[data-testid^="postingDropDownItemToAnnulate"]'));
                     targetOption = options.find(el => {
@@ -527,7 +503,7 @@
             attempts++;
             if (document.querySelectorAll('[data-testid^="postingDropDownItemToAnnulate"]').length > 0) {
                 clearInterval(checkDropdown);
-                injectReasonNumbers(); 
+                injectReasonNumbers();
                 selectFromOpenMenu();
             } else if (attempts > 15) {
                 clearInterval(checkDropdown);
