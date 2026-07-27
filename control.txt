@@ -2,7 +2,7 @@
 // @name         Ozon Smart Control (by desslow)
 // @namespace    http://tampermonkey.net/
 // @version      7.6
-// @description  Клавиатурный режим выдачи заказов клиентам + навигация.
+// @description  Клавиатурный режим выдачи заказов клиентам.
 // @author       desslow
 // @match        https://*.ozon.ru/*
 // @grant        none
