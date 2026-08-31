@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Ozon Smart Control (by desslow)
 // @namespace    http://tampermonkey.net/
-// @version      7.7
+// @version      7.8
 // @description  Клавиатурный режим выдачи заказов клиентам.
 // @author       desslow
 // @match        https://*.ozon.ru/*
@@ -65,7 +65,7 @@
 
     let audioCtx = null;
 
-    console.log("[Smart Control] Скрипт версии 7.7 запущен (с изоляцией SPA).");
+    console.log("[Smart Control] Скрипт версии 7.8 запущен.");
 
     // --------------------------------------------------------
     // 0. ВНЕДРЕНИЕ НАБЛЮДАТЕЛЯ (MUTATION OBSERVER) И CSS
@@ -495,16 +495,18 @@
             let targetOption = null;
 
             if (isDoubleScan) {
-                const badge = document.querySelector('.numpad-badge-helper[data-reason-num="4"]');
-                if (badge) targetOption = badge.closest('[data-testid^="postingDropDownItemToAnnulate"]');
+                // const badge = document.querySelector('.numpad-badge-helper[data-reason-num="4"]');
+                // if (badge) targetOption = badge.closest('[data-testid^="postingDropDownItemToAnnulate"]');
 
-                if (!targetOption) {
-                    const options = Array.from(document.querySelectorAll('[data-testid^="postingDropDownItemToAnnulate"]'));
-                    targetOption = options.find(el => {
-                        const text = el.textContent.toLowerCase();
-                        return text.includes('решени') || text.includes('отказ');
-                    }) || options[0];
-                }
+                // if (!targetOption) {
+                //     const options = Array.from(document.querySelectorAll('[data-testid^="postingDropDownItemToAnnulate"]'));
+                //     targetOption = options.find(el => {
+                //         const text = el.textContent.toLowerCase();
+                //         return text.includes('решени') || text.includes('отказ');
+                //     }) || options[0];
+                // }
+
+                // update 31.08 / Ozon added annulate from doublescan
             } else {
                 const badge = document.querySelector(`.numpad-badge-helper[data-reason-num="${requestedNum}"]`);
                 if (badge) {
