@@ -3,7 +3,7 @@
 // @namespace    http://tampermonkey.net/
 // @version      8.6
 // @description  Клавиатурный режим выдачи заказов.
-// @author       desslow
+// @author       desslow & assistant
 // @match        https://*.ozon.ru/*
 // @run-at       document-start
 // @grant        none
@@ -553,6 +553,29 @@
         }
     }
 
+    function updateDynamicButtonsUI() {
+        const count = getSelectedCards().length;
+
+        const btnCheck = document.getElementById('smart-btn-check-all');
+        const btnGiveout = document.getElementById('smart-btn-giveout-all');
+        const btnRefuse = document.getElementById('smart-btn-refuse-all');
+        const btnKeep = document.getElementById('smart-btn-keep-all');
+
+        if (!btnCheck || !btnGiveout || !btnRefuse || !btnKeep) return;
+
+        if (count > 0) {
+            btnCheck.innerHTML = `${count} на проверку <span class="smart-keycap">RCtrl+1</span>`;
+            btnGiveout.innerHTML = `${count} к выдаче <span class="smart-keycap">RCtrl+2</span>`;
+            btnRefuse.innerHTML = `${count} в отказ <span class="smart-keycap">RCtrl+3</span>`;
+            btnKeep.innerHTML = `${count} на хранение <span class="smart-keycap">RCtrl+4</span>`;
+        } else {
+            btnCheck.innerHTML = `Все на проверку <span class="smart-keycap">RCtrl+1</span>`;
+            btnGiveout.innerHTML = `Все к выдаче <span class="smart-keycap">RCtrl+2</span>`;
+            btnRefuse.innerHTML = `Все в отказ <span class="smart-keycap">RCtrl+3</span>`;
+            btnKeep.innerHTML = `Все на хранение <span class="smart-keycap">RCtrl+4</span>`;
+        }
+    }
+
     function injectControlPanel() {
         if (!isSessionActive()) {
             const existing = document.getElementById('smart-control-panel');
@@ -987,6 +1010,7 @@
         injectControlPanel();
         updateSessionTimerUI();
         updateStatusSlotUI();
+        updateDynamicButtonsUI();
         fixKgtShelves();
     }, 200);
 
