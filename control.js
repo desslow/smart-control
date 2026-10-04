@@ -3,7 +3,7 @@
 // @namespace    http://tampermonkey.net/
 // @version      8.6
 // @description  Клавиатурный режим выдачи заказов.
-// @author       desslow & assistant
+// @author       desslow
 // @match        https://*.ozon.ru/*
 // @run-at       document-start
 // @grant        none
