@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Ozon Smart Control (by desslow)
 // @namespace    http://tampermonkey.net/
-// @version      8.2
-// @description  Клавиатурный режим, таймер foundAt, пульсирующая оплата, дропдаун, бинды RCtrl+1..7
+// @version      8.3
+// @description  Клавиатурный режим, чистый перехват Sessions/Postings без дублей, дебаг в консоли
 // @author       desslow & assistant
 // @match        https://*.ozon.ru/*
 // @run-at       document-start
@@ -12,12 +12,18 @@
 (function() {
     'use strict';
 
-    // ================= ПЕРЕХВАТЧИК ТОКЕНОВ =================
+    // ================= ПЕРЕХВАТЧИК СЕТИ С ДЕБАГОМ =================
     window._ozonAuthHeaders = null;
+    let sessionsMap = new Map();
+    let currentPostingsData = null;
+
     const origFetch = window.fetch;
     window.fetch = async function(...args) {
         try {
             const config = args[1];
+            const url = typeof args[0] === 'string' ? args[0] : (args[0]?.url || '');
+
+            // 1. Сохраняем актуальные токены
             if (config && config.headers) {
                 let headersObj = new Headers(config.headers);
                 if (headersObj.has('authorization')) {
@@ -29,21 +35,50 @@
                     };
                 }
             }
-        } catch (e) {}
-        return origFetch.apply(this, args);
+
+            const response = await origFetch.apply(this, args);
+
+            // 2. ПЕРЕХВАТ РОДНОГО ЗАПРОСА ОЗОНА: Sessions
+            if (url.includes('/api2/giveout/Sessions')) {
+                const clone = response.clone();
+                clone.json().then(data => {
+                    if (data && Array.isArray(data.sessions) && data.sessions.length > 0) {
+                        console.log('%c[Smart Control] 🟢 Родной ответ Озона Sessions перехвачен! Сессий:', 'color: #10b981; font-weight: bold;', data.sessions.length);
+                        data.sessions.forEach(s => {
+                            if (s.sessionId && s.foundAt) {
+                                const ts = new Date(s.foundAt).getTime();
+                                sessionsMap.set(String(s.sessionId), ts);
+                                localStorage.setItem(`ozon_found_at_${s.sessionId}`, String(ts));
+                                console.log(`%c[Smart Control] -> Кэширован foundAt для сессии ${s.sessionId} (${s.clientShortName}): ${s.foundAt}`, 'color: #06b6d4;');
+                            }
+                        });
+                    }
+                }).catch(() => {});
+            }
+
+            // 3. ПЕРЕХВАТ РОДНОГО ЗАПРОСА ОЗОНА: Postings (Товары и оплата)
+            if (url.includes('/api2/giveout/Postings')) {
+                const clone = response.clone();
+                clone.json().then(data => {
+                    if (data && Array.isArray(data.postings)) {
+                        console.log('%c[Smart Control] 📦 Родной ответ Озона Postings перехвачен! Посылок:', 'color: #3b82f6; font-weight: bold;', data.postings.length);
+                        currentPostingsData = data.postings;
+                        
+                        // Считаем сумму к оплате
+                        const toPay = currentPostingsData.reduce((acc, p) => acc + (p.clientAmount || 0), 0);
+                        console.log(`%c[Smart Control] 💰 Итоговая сумма к оплате: ${toPay} ₽`, 'color: #f59e0b; font-weight: bold;');
+                        updatePaymentUI(toPay);
+                    }
+                }).catch(() => {});
+            }
+
+            return response;
+        } catch (e) {
+            return origFetch.apply(this, args);
+        }
     };
 
-    // ================= СОСТОЯНИЕ СЕССИИ И ОПЛАТЫ =================
-    let currentSessionId = null;
-    let currentFoundAtTimestamp = null;
-    let currentPaymentAmount = 0;
-    let isFetchingSessionData = false;
-
-    function getCurrentSessionIdFromUrl() {
-        const match = window.location.pathname.match(/\/orders\/session(?:-new)?\/(\d+)/);
-        return match ? match[1] : null;
-    }
-
+    // ================= СЛУЖЕБНЫЕ ПРОВЕРКИ =================
     function isSessionPage() {
         const path = window.location.pathname;
         const hasSessionUrl = /\/orders\/session(-new)?\/\d+/.test(path);
@@ -51,44 +86,9 @@
         return hasSessionUrl || (path.includes('/orders') && hasCards);
     }
 
-    // Активный запрос сессий и товаров через API Озона
-    async function syncSessionAndPostings(sessionId) {
-        if (!sessionId || !window._ozonAuthHeaders || isFetchingSessionData) return;
-        isFetchingSessionData = true;
-
-        try {
-            // 1. Запрашиваем Sessions для вычисления РЕАЛЬНОГО foundAt
-            const sessRes = await fetch('https://turbo-pvz.ozon.ru/api2/giveout/Sessions?filterByCurrentUser=false', {
-                headers: window._ozonAuthHeaders,
-                credentials: 'same-origin'
-            });
-
-            if (sessRes.ok) {
-                const data = await sessRes.json();
-                const sessionObj = data.sessions?.find(s => String(s.sessionId) === String(sessionId));
-                if (sessionObj && sessionObj.foundAt) {
-                    currentFoundAtTimestamp = new Date(sessionObj.foundAt).getTime();
-                    localStorage.setItem(`ozon_found_at_${sessionId}`, String(currentFoundAtTimestamp));
-                }
-            }
-        } catch (e) {}
-
-        try {
-            // 2. Запрашиваем Postings для подсчета суммы "К оплате"
-            const postRes = await fetch(`https://turbo-pvz.ozon.ru/api2/giveout/Postings?sessionId=${sessionId}&imageSize=800`, {
-                headers: window._ozonAuthHeaders,
-                credentials: 'same-origin'
-            });
-
-            if (postRes.ok) {
-                const data = await postRes.json();
-                const postings = data.postings || [];
-                currentPaymentAmount = postings.reduce((sum, p) => sum + (p.clientAmount || 0), 0);
-                updatePaymentUI();
-            }
-        } catch (e) {}
-
-        isFetchingSessionData = false;
+    function getCurrentSessionIdFromUrl() {
+        const match = window.location.pathname.match(/\/orders\/session(?:-new)?\/(\d+)/);
+        return match ? match[1] : null;
     }
 
     // ================= КОНСТАНТЫ КЛАВИШ =================
@@ -112,7 +112,11 @@
 
     const CIS_PATTERN = /^[^a-zA-Z0-9]*01\d{13,14}21.+$/;
 
-    // Состояние интерфейса
+    // Состояние скрипта
+    let currentSessionId = null;
+    let currentFoundAtTimestamp = null;
+    let calculatedPaymentAmount = 0;
+
     let activePackageIndex = 0;
     let activeBarcode = '';
     let lastScannedBarcode = '';
@@ -136,10 +140,12 @@
     let isMouseDown = false;
     let isDraggingSelection = false;
 
+    console.log("%c[Smart Control v8.3] Инициализирован в фоновом режиме", "color: #ff9800; font-weight: bold;");
+
     // ================= СТИЛИ (CSS) =================
     const style = document.createElement('style');
     style.innerHTML = `
-        /* Запрет выделения текста на карточках */
+        /* Запрет системного выделения текста при мультивыборе */
         ._card_1w2zp_1, [class*="_card_"], [class*="_item_"], #smart-control-panel {
             user-select: none !important;
             -webkit-user-select: none !important;
@@ -158,7 +164,7 @@
             transition: outline 0.15s, box-shadow 0.15s;
         }
 
-        /* Выделенные карточки */
+        /* Мультивыбор карточек */
         .smart-control-selected {
             outline: 3px solid #ff9800 !important;
             outline-offset: -2px !important;
@@ -185,7 +191,7 @@
             pointer-events: none;
         }
 
-        /* Прогресс Enter */
+        /* Прогресс удержания Enter */
         .smart-btn-progress { position: relative !important; overflow: hidden !important; }
         .smart-btn-progress::after {
             content: ''; position: absolute; top: 0; left: 0; bottom: 0;
@@ -231,14 +237,14 @@
         .smart-panel-btn:hover { filter: brightness(1.15); transform: translateY(-1px); }
         .smart-panel-btn:active { transform: scale(0.96); }
 
-        /* Цвета */
-        .btn-check   { background: #005bff !important; } /* Синяя */
-        .btn-giveout { background: #10b981 !important; } /* Зеленая */
-        .btn-refuse  { background: #ef4444 !important; } /* Красная */
-        .btn-keep    { background: #4b5563 !important; } /* Серая */
+        /* Цвета кнопок */
+        .btn-check   { background: #005bff !important; }
+        .btn-giveout { background: #10b981 !important; }
+        .btn-refuse  { background: #ef4444 !important; }
+        .btn-keep    { background: #4b5563 !important; }
         .btn-more    { background: rgba(255, 255, 255, 0.1) !important; border: 1px solid rgba(255, 255, 255, 0.2) !important; }
 
-        /* Красивые клавишные бейджи (Keycaps) */
+        /* Кейкапы клавиш (RCtrl+X) */
         .smart-keycap {
             background: rgba(0, 0, 0, 0.35);
             border: 1px solid rgba(255, 255, 255, 0.25);
@@ -265,7 +271,7 @@
             white-space: nowrap;
         }
 
-        /* Неоновая пульсирующая оплата */
+        /* Неоновая пульсирующая плашка оплаты */
         @keyframes pulse-neon {
             0%   { box-shadow: 0 0 6px rgba(239, 68, 68, 0.5); border-color: rgba(239, 68, 68, 0.6); }
             50%  { box-shadow: 0 0 18px rgba(239, 68, 68, 0.95); border-color: #ef4444; }
@@ -305,7 +311,7 @@
             border: 1px solid rgba(16, 185, 129, 0.35);
         }
 
-        /* Выпадающее меню "Еще ▾" */
+        /* Дропдаун "Еще ▾" */
         #smart-more-dropdown {
             position: absolute;
             bottom: calc(100% + 8px);
@@ -343,7 +349,7 @@
     `;
     document.head.appendChild(style);
 
-    // ================= ТАЙМЕР СЕССИИ (foundAt) =================
+    // ================= ОБНОВЛЕНИЕ ТАЙМЕРА =================
     function updateSessionTimerUI() {
         const timerEl = document.getElementById('smart-session-timer');
         if (!timerEl) return;
@@ -351,11 +357,20 @@
         const sessionId = getCurrentSessionIdFromUrl();
         if (sessionId && sessionId !== currentSessionId) {
             currentSessionId = sessionId;
-            // Пробуем взять сохраненный foundAt из кэша
-            const cached = localStorage.getItem(`ozon_found_at_${sessionId}`);
-            currentFoundAtTimestamp = cached ? parseInt(cached, 10) : null;
-            // Фоново дергаем API
-            syncSessionAndPostings(sessionId);
+
+            // Ищем сохраненный foundAt из перехвата
+            let foundAtTime = sessionsMap.get(String(sessionId));
+            if (!foundAtTime) {
+                const cached = localStorage.getItem(`ozon_found_at_${sessionId}`);
+                if (cached) foundAtTime = parseInt(cached, 10);
+            }
+
+            if (foundAtTime) {
+                currentFoundAtTimestamp = foundAtTime;
+                console.log(`%c[Smart Control] ⏱ Таймер сессии ${sessionId} запущен от foundAt:`, 'color: #ff9800;', new Date(foundAtTime).toLocaleTimeString());
+            } else {
+                console.warn(`[Smart Control] ⚠️ foundAt для сессии ${sessionId} еще не перехвачен, ждем обновления.`);
+            }
         }
 
         if (!currentFoundAtTimestamp) {
@@ -369,13 +384,14 @@
         timerEl.textContent = `⏱ ${mins}:${secs}`;
     }
 
-    function updatePaymentUI() {
+    function updatePaymentUI(amount) {
+        if (typeof amount === 'number') calculatedPaymentAmount = amount;
         const payEl = document.getElementById('smart-session-pay');
         if (!payEl) return;
 
-        if (currentPaymentAmount > 0) {
+        if (calculatedPaymentAmount > 0) {
             payEl.className = 'smart-panel-pay pay-needed';
-            payEl.innerHTML = `<span class="pay-dot"></span>К оплате: ${currentPaymentAmount} ₽`;
+            payEl.innerHTML = `<span class="pay-dot"></span>К оплате: ${calculatedPaymentAmount} ₽`;
         } else {
             payEl.className = 'smart-panel-pay pay-clean';
             payEl.innerHTML = `✓ Оплачено`;
@@ -430,13 +446,13 @@
         `;
         document.body.appendChild(panel);
 
-        // Обработчики кнопок
+        // Кнопки
         document.getElementById('smart-btn-check-all').onclick = () => massExecute('check');
         document.getElementById('smart-btn-giveout-all').onclick = () => massExecute('giveout');
         document.getElementById('smart-btn-refuse-all').onclick = () => massExecute('refuse');
         document.getElementById('smart-btn-keep-all').onclick = () => massExecute('keep');
 
-        // Логика дропдауна "Еще ▾"
+        // Дропдаун
         const moreBtn = document.getElementById('smart-btn-more');
         const dropdown = document.getElementById('smart-more-dropdown');
 
@@ -527,6 +543,8 @@
         let targets = getSelectedCards();
         if (targets.length === 0) targets = getAllCards();
 
+        console.log(`[Smart Control] ⚡ Выполнение массового действия "${actionType}" для ${targets.length} карточек`);
+
         for (let card of targets) {
             if (actionType === 'check') {
                 const isAnnulated = card.querySelector('[data-testid="btnToAnnulate"], [class*="_annulation_"]');
@@ -602,7 +620,7 @@
         newTarget.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
     }
 
-    // ================= ГЛАВНЫЙ ИНТЕРВАЛ =================
+    // ================= ГЛАВНЫЙ ТИК =================
     setInterval(() => {
         if (!isSessionPage()) {
             const p = document.getElementById('smart-control-panel');
@@ -616,7 +634,7 @@
         updateSessionTimerUI();
     }, 200);
 
-    // ================= СЛУЖЕБНЫЙ ФУНКЦИОНАЛ ВЫДАЧИ =================
+    // ================= ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ВЫДАЧИ =================
     function injectReasonNumbers() {
         const dropdownItems = document.querySelectorAll('[data-testid^="postingDropDownItemToAnnulate"]');
         if (dropdownItems.length === 0) return;
