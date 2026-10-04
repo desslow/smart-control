@@ -1,0 +1,821 @@
+// ==UserScript==
+// @name         Ozon Smart Control
+// @namespace    http://tampermonkey.net/
+// @version      8.0
+// @description  Клавиатурный режим выдачи, стрелки, мультивыбор, панель массовых действий, таймер сессии.
+// @author       desslow
+// @match        https://*.ozon.ru/*
+// @grant        none
+// ==/UserScript==
+
+(function() {
+    'use strict';
+
+    function isOrdersPage() {
+        return window.location.pathname.includes('/orders');
+    }
+
+    // Константы клавиш
+    const KEY_ENTER = 'NumpadEnter';
+    const KEY_ADD = 'NumpadAdd';
+    const KEY_SUBTRACT = 'NumpadSubtract';
+    const KEY_MULTIPLY = 'NumpadMultiply';
+    const KEY_CHECK = 'Numpad0';
+
+    const REASON_KEYS = ['Numpad1', 'Numpad2', 'Numpad3', 'Numpad4', 'Numpad5'];
+
+    // Карта транслитерации
+    const RUS_TO_ENG = {
+        'й': 'q', 'ц': 'w', 'у': 'e', 'к': 'r', 'е': 't', 'н': 'y', 'г': 'u', 'ш': 'i', 'щ': 'o', 'з': 'p',
+        'х': '[', 'ъ': ']', 'ф': 'a', 'ы': 's', 'в': 'd', 'а': 'f', 'п': 'g', 'р': 'h', 'о': 'j', 'л': 'k',
+        'д': 'l', 'ж': ';', 'э': "'", 'я': 'z', 'ч': 'x', 'с': 'c', 'м': 'v', 'и': 'b', 'т': 'n', 'ь': 'm',
+        'б': ',', 'ю': '.', '.': '/', 'Ё': '~', 'ё': '`',
+        'Й': 'Q', 'Ц': 'W', 'У': 'E', 'К': 'R', 'Е': 'T', 'Н': 'Y', 'Г': 'U', 'Ш': 'I', 'Щ': 'O', 'З': 'P',
+        'Х': '{', 'Ъ': '}', 'Ф': 'A', 'Ы': 'S', 'В': 'D', 'А': 'F', 'П': 'G', 'Р': 'H', 'О': 'J', 'Л': 'K',
+        'Д': 'L', 'Ж': ':', 'Э': '"', 'Я': 'Z', 'Ч': 'X', 'С': 'C', 'М': 'V', 'И': 'B', 'Т': 'N', 'Ь': 'M',
+        'Б': '<', 'Ю': '>', ',': '?'
+    };
+
+    const CIS_PATTERN = /^[^a-zA-Z0-9]*01\d{13,14}21.+$/;
+
+    // Состояние скрипта
+    let activePackageIndex = 0;
+    let activeBarcode = '';
+    let lastScannedBarcode = '';
+    let lastScanTime = 0;
+    let lastSuccessCard = null;
+
+    let scanBuffer = '';
+    let lastScanKeyTime = Date.now();
+
+    let enterHoldTimeout = null;
+    let isEnterHolding = false;
+    let heldButton = null;
+    let enterBlockUntil = 0;
+
+    let numpad0Presses = 0;
+    let numpad0Timer = null;
+    let numpadReasonPresses = {};
+    let numpadReasonTimers = {};
+
+    let audioCtx = null;
+
+    // Таймер сессии клиента
+    let currentClientName = '';
+    let sessionStartTime = Date.now();
+
+    // Переменные для выделения мышкой (Drag to Select)
+    let isMouseDown = false;
+    let isDraggingSelection = false;
+
+    console.log("[Smart Control] Скрипт версии 8.0 запущен.");
+
+    // --------------------------------------------------------
+    // 0. СТИЛИ И НАБЛЮДАТЕЛЬ (MUTATION OBSERVER)
+    // --------------------------------------------------------
+    const observer = new MutationObserver((mutations) => {
+        if (!isOrdersPage()) return;
+
+        for (let m of mutations) {
+            if (m.type === 'attributes' && m.attributeName === 'class') {
+                const el = m.target;
+                if (el.className && typeof el.className === 'string' && el.className.includes('_success_')) {
+                    const card = el.closest('[class*="_card_"], [class*="_item_"]');
+                    if (card) lastSuccessCard = card;
+                }
+            }
+        }
+    });
+    observer.observe(document.documentElement, { attributes: true, subtree: true, attributeFilter: ['class'] });
+
+    const style = document.createElement('style');
+    style.innerHTML = `
+        /* Одиночный активный фокус */
+        .smart-control-focus {
+            outline: 4px solid #ff9800 !important;
+            outline-offset: -2px !important;
+            box-shadow: 0 0 10px rgba(255, 152, 0, 0.7) !important;
+            border-radius: 14px;
+            transition: outline 0.15s, box-shadow 0.15s;
+        }
+
+        /* Выделенные карточки (мультивыбор) */
+        .smart-control-selected {
+            outline: 3px solid #ff9800 !important;
+            outline-offset: -2px !important;
+            background-color: rgba(255, 152, 0, 0.08) !important;
+            position: relative;
+        }
+        .smart-control-selected::after {
+            content: '✓';
+            position: absolute;
+            top: 10px;
+            right: 10px;
+            background: #ff9800;
+            color: #ffffff;
+            font-size: 13px;
+            font-weight: 900;
+            width: 22px;
+            height: 22px;
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            box-shadow: 0 2px 6px rgba(0,0,0,0.3);
+            z-index: 15;
+            pointer-events: none;
+        }
+
+        /* Прогресс удержания Enter */
+        .smart-btn-progress {
+            position: relative !important;
+            overflow: hidden !important;
+        }
+        .smart-btn-progress::after {
+            content: '';
+            position: absolute;
+            top: 0; left: 0; bottom: 0;
+            width: var(--smart-progress, 0%);
+            background-color: rgba(228, 0, 124, 0.5) !important;
+            transition: width 0.4s linear, opacity 0.2s ease-out;
+            pointer-events: none;
+            z-index: 10;
+            border-radius: inherit;
+        }
+        .smart-btn-progress.done::after {
+            opacity: 0;
+        }
+
+        /* Нижняя панель действий (Floating Bar) */
+        #smart-control-panel {
+            position: fixed;
+            bottom: 18px;
+            left: 50%;
+            transform: translateX(-50%);
+            background: rgba(18, 24, 38, 0.95);
+            backdrop-filter: blur(10px);
+            border: 1px solid rgba(255, 255, 255, 0.15);
+            border-radius: 14px;
+            padding: 8px 14px;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            box-shadow: 0 10px 30px rgba(0, 0, 0, 0.5);
+            z-index: 999999;
+            font-family: inherit;
+        }
+        .smart-panel-btn {
+            background: rgba(255, 255, 255, 0.1);
+            color: #ffffff;
+            border: 1px solid rgba(255, 255, 255, 0.15);
+            padding: 6px 12px;
+            border-radius: 8px;
+            font-size: 13px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.2s;
+            user-select: none;
+            display: flex;
+            align-items: center;
+            gap: 5px;
+        }
+        .smart-panel-btn:hover {
+            background: rgba(255, 255, 255, 0.22);
+            border-color: rgba(255, 255, 255, 0.3);
+        }
+        .smart-panel-btn:active {
+            transform: scale(0.96);
+        }
+        .smart-panel-timer {
+            color: #ff9800;
+            font-family: monospace;
+            font-size: 14px;
+            font-weight: bold;
+            padding: 4px 8px;
+            background: rgba(255, 152, 0, 0.12);
+            border: 1px solid rgba(255, 152, 0, 0.3);
+            border-radius: 6px;
+            margin-right: 4px;
+            display: flex;
+            align-items: center;
+            gap: 4px;
+        }
+    `;
+    document.head.appendChild(style);
+
+    // --------------------------------------------------------
+    // 1. ПАНЕЛЬ ДЕЙСТВИЙ И ТАЙМЕР
+    // --------------------------------------------------------
+    function updateSessionTimer() {
+        const clientEl = document.querySelector('._clientName_sq209_35, [class*="_clientName_"]');
+        const name = clientEl ? clientEl.textContent.trim() : '';
+
+        if (name && name !== currentClientName) {
+            currentClientName = name;
+            sessionStartTime = Date.now();
+        }
+
+        const timerEl = document.getElementById('smart-session-timer');
+        if (timerEl) {
+            const elapsed = Math.floor((Date.now() - sessionStartTime) / 1000);
+            const mins = String(Math.floor(elapsed / 60)).padStart(2, '0');
+            const secs = String(elapsed % 60).padStart(2, '0');
+            timerEl.textContent = `⏱ ${mins}:${secs}`;
+        }
+    }
+
+    function injectControlPanel() {
+        if (!isOrdersPage()) {
+            const existing = document.getElementById('smart-control-panel');
+            if (existing) existing.remove();
+            return;
+        }
+
+        if (document.getElementById('smart-control-panel')) return;
+
+        const panel = document.createElement('div');
+        panel.id = 'smart-control-panel';
+        panel.innerHTML = `
+            <div id="smart-session-timer" class="smart-panel-timer">⏱ 00:00</div>
+            <button class="smart-panel-btn" id="smart-btn-check-all">Все на проверку</button>
+            <button class="smart-panel-btn" id="smart-btn-giveout-all">Все к выдаче</button>
+            <button class="smart-panel-btn" id="smart-btn-keep-all">Все на хранение</button>
+            <button class="smart-panel-btn" id="smart-btn-select-all" style="background: rgba(255, 152, 0, 0.2); border-color: #ff9800;">Выделить все</button>
+            <button class="smart-panel-btn" id="smart-btn-deselect-all">Снять все</button>
+        `;
+        document.body.appendChild(panel);
+
+        // Навешиваем события на кнопки панели
+        document.getElementById('smart-btn-select-all').onclick = () => selectAllCards(true);
+        document.getElementById('smart-btn-deselect-all').onclick = () => selectAllCards(false);
+        document.getElementById('smart-btn-check-all').onclick = () => massExecute('check');
+        document.getElementById('smart-btn-giveout-all').onclick = () => massExecute('giveout');
+        document.getElementById('smart-btn-keep-all').onclick = () => massExecute('keep');
+    }
+
+    // --------------------------------------------------------
+    // 2. ВЫДЕЛЕНИЕ МЫШКОЙ И КЛИКАМИ
+    // --------------------------------------------------------
+    function getAllCards() {
+        return Array.from(document.querySelectorAll('._card_1w2zp_1, [class*="_card_"]'));
+    }
+
+    function getSelectedCards() {
+        return Array.from(document.querySelectorAll('.smart-control-selected'));
+    }
+
+    function selectAllCards(select = true) {
+        getAllCards().forEach(c => {
+            if (select) c.classList.add('smart-control-selected');
+            else c.classList.remove('smart-control-selected');
+        });
+    }
+
+    // Обработка Drag-to-select (зажатая ЛКМ)
+    window.addEventListener('mousedown', function(e) {
+        if (!isOrdersPage()) return;
+        if (e.button !== 0) return; // Только ЛКМ
+
+        // Если клик по кнопкам или инпутам - не включаем выделение
+        if (e.target.closest('button, input, textarea, a, svg, #smart-control-panel')) return;
+
+        isMouseDown = true;
+        isDraggingSelection = false;
+    }, true);
+
+    window.addEventListener('mousemove', function(e) {
+        if (!isMouseDown) return;
+
+        const card = e.target.closest('._card_1w2zp_1, [class*="_card_"]');
+        if (card) {
+            isDraggingSelection = true;
+            card.classList.add('smart-control-selected');
+        }
+    }, true);
+
+    window.addEventListener('mouseup', function(e) {
+        if (!isOrdersPage()) return;
+
+        // Если это был просто одиночный клик по пустой области карточки (без перетаскивания)
+        if (isMouseDown && !isDraggingSelection && e.button === 0) {
+            if (!e.target.closest('button, input, textarea, a, svg, #smart-control-panel')) {
+                const card = e.target.closest('._card_1w2zp_1, [class*="_card_"]');
+                if (card) {
+                    card.classList.toggle('smart-control-selected');
+                }
+            }
+        }
+
+        isMouseDown = false;
+        setTimeout(() => { isDraggingSelection = false; }, 50);
+    }, true);
+
+    // --------------------------------------------------------
+    // 3. МАССОВЫЕ ДЕЙСТВИЯ (С ЗАЩИТНЫМ ИНТЕРВАЛОМ)
+    // --------------------------------------------------------
+    async function massExecute(actionType) {
+        let targets = getSelectedCards();
+        if (targets.length === 0) {
+            targets = getAllCards(); // Если ничего не выбрано — применяем ко всем
+        }
+
+        for (let card of targets) {
+            if (actionType === 'check') {
+                // Защита от сброса аннуляции: не проверяем аннулированные товары
+                const isAnnulated = card.querySelector('[data-testid="btnToAnnulate"], [class*="_annulation_"]');
+                if (isAnnulated) continue;
+
+                const btn = card.querySelector('[data-testid="btnToCheck"]');
+                if (btn) simulateRealClick(btn);
+            } 
+            else if (actionType === 'giveout') {
+                const btn = card.querySelector('[data-testid="btnToGiveOut"]');
+                if (btn) simulateRealClick(btn);
+            } 
+            else if (actionType === 'keep') {
+                const btn = card.querySelector('[data-testid="btnToKeep"]');
+                if (btn) simulateRealClick(btn);
+            }
+            await new Promise(r => setTimeout(r, 70)); // Задержка 70мс между карточками
+        }
+    }
+
+    // --------------------------------------------------------
+    // 4. НАВИГАЦИЯ СТРЕЛКАМИ (ФОКУС)
+    // --------------------------------------------------------
+    function navigateCards(direction) {
+        const cards = getAllCards();
+        if (cards.length === 0) return;
+
+        let currentIndex = cards.indexOf(getTargetItem());
+        if (currentIndex === -1) currentIndex = 0;
+
+        if (direction === 'down' || direction === 'right') {
+            currentIndex = (currentIndex + 1) % cards.length;
+        } else if (direction === 'up' || direction === 'left') {
+            currentIndex = (currentIndex - 1 + cards.length) % cards.length;
+        }
+
+        const newTarget = cards[currentIndex];
+        lastSuccessCard = newTarget;
+
+        const ta = newTarget.querySelector('textarea[aria-hidden="true"], input[type="text"]');
+        if (ta) activeBarcode = ta.value || ta.getAttribute('value') || ta.textContent;
+
+        maintainFocusVisual();
+        newTarget.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+    }
+
+    // --------------------------------------------------------
+    // 5. ОСНОВНОЙ ЦИКЛ ОБНОВЛЕНИЯ
+    // --------------------------------------------------------
+    setInterval(() => {
+        if (!isOrdersPage()) return;
+        highlightActivePackage();
+        injectReasonNumbers();
+        maintainFocusVisual();
+        injectControlPanel();
+        updateSessionTimer();
+    }, 200);
+
+    function injectReasonNumbers() {
+        const dropdownItems = document.querySelectorAll('[data-testid^="postingDropDownItemToAnnulate"]');
+        if (dropdownItems.length === 0) return;
+
+        const usedNums = new Set();
+
+        dropdownItems.forEach(item => {
+            const labelContainer = item.querySelector('[class*="data-content__label"]') || item;
+            const existingBadge = labelContainer.querySelector('.numpad-badge-helper');
+            if (existingBadge) {
+                usedNums.add(parseInt(existingBadge.dataset.reasonNum, 10));
+                return;
+            }
+
+            let text = labelContainer.textContent.toLowerCase();
+            let num = null;
+
+            if (text.includes('брак') || text.includes('поврежд') || text.includes('разбит') || text.includes('дефект')) num = 1;
+            else if (text.includes('ошиб') || text.includes('не тот') || text.includes('подмен') || text.includes('пересорт')) num = 2;
+            else if (text.includes('неполн') || text.includes('пуст') || text.includes('част') || text.includes('вскрыт')) num = 3;
+            else if (text.includes('решени') || text.includes('отказ') || text.includes('клиент') || text.includes('передумал')) num = 4;
+            else if (text.includes('срок') || text.includes('просроч') || text.includes('проч') || text.includes('опозд')) num = 5;
+
+            if (num) {
+                item.dataset.fixedNum = num;
+                usedNums.add(num);
+            }
+        });
+
+        dropdownItems.forEach(item => {
+            const labelContainer = item.querySelector('[class*="data-content__label"]') || item;
+            if (labelContainer.querySelector('.numpad-badge-helper')) return;
+
+            let num = item.dataset.fixedNum;
+            if (!num) {
+                for (let i = 1; i <= 9; i++) {
+                    if (!usedNums.has(i)) {
+                        num = i;
+                        usedNums.add(i);
+                        break;
+                    }
+                }
+            }
+
+            if (num) {
+                const badge = document.createElement('span');
+                badge.className = 'numpad-badge-helper';
+                badge.dataset.reasonNum = num;
+                badge.style.marginLeft = '12px';
+                badge.style.padding = '2px 6px';
+                badge.style.background = '#e4e6e9';
+                badge.style.color = '#4e5b6c';
+                badge.style.border = '1px solid #cbced4';
+                badge.style.borderRadius = '4px';
+                badge.style.fontSize = '11px';
+                badge.style.fontWeight = 'bold';
+                badge.style.fontFamily = 'monospace';
+                badge.style.display = 'inline-block';
+                badge.style.boxShadow = '0 1px 0 rgba(0,0,0,0.15)';
+                badge.textContent = `[Num ${num}]`;
+
+                labelContainer.appendChild(badge);
+            }
+        });
+    }
+
+    // --------------------------------------------------------
+    // 6. ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ФОКУСА И ЗВУКА
+    // --------------------------------------------------------
+    function initAudio() {
+        if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+        if (audioCtx.state === 'suspended') audioCtx.resume();
+    }
+
+    function playAnnulateAlert() {
+        initAudio();
+        const t = audioCtx.currentTime;
+        const playNote = (start, freq) => {
+            const osc = audioCtx.createOscillator();
+            const gain = audioCtx.createGain();
+            osc.type = 'sawtooth';
+            osc.frequency.setValueAtTime(freq, start);
+            osc.frequency.exponentialRampToValueAtTime(freq / 2, start + 0.2);
+            gain.gain.setValueAtTime(3.0, start);
+            gain.gain.exponentialRampToValueAtTime(0.01, start + 0.2);
+            osc.connect(gain);
+            gain.connect(audioCtx.destination);
+            osc.start(start);
+            osc.stop(start + 0.2);
+        };
+        playNote(t, 400);
+        playNote(t, 420);
+        playNote(t + 0.15, 300);
+        playNote(t + 0.15, 315);
+    }
+
+    function isInputActive() {
+        const el = document.activeElement;
+        return el && (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' || el.isContentEditable);
+    }
+
+    function findItemByBarcode(barcode) {
+        if (!barcode) return null;
+        const lowerBarcode = barcode.trim().toLowerCase();
+        const textareas = document.querySelectorAll('textarea[aria-hidden="true"], input[type="text"], input[type="hidden"]');
+        for (let el of textareas) {
+            const val = el.value || el.getAttribute('value') || el.textContent;
+            if (val && val.trim().toLowerCase() === lowerBarcode) {
+                return el.closest('[class*="_card_"], [class*="_item_"]') || el.parentElement;
+            }
+        }
+        const direct = document.querySelector(`[data-testid*="${barcode}"]`);
+        return direct ? (direct.closest('[class*="_card_"], [class*="_item_"]') || direct) : null;
+    }
+
+    function getTargetItem() {
+        let item = null;
+        if (activeBarcode) item = findItemByBarcode(activeBarcode);
+        if (!item && lastSuccessCard && document.body.contains(lastSuccessCard)) {
+            item = lastSuccessCard;
+        }
+        if (!item) {
+            const successCards = document.querySelectorAll('[class*="_success_"]');
+            if (successCards.length > 0) item = successCards[successCards.length - 1].closest('[class*="_card_"]');
+        }
+        if (!item) {
+            const anyBtn = document.querySelector('[data-testid="btnToCheck"], [data-testid="btnToGiveOut"]');
+            if (anyBtn) item = anyBtn.closest('[class*="_card_"]');
+        }
+        return item;
+    }
+
+    function highlightActivePackage() {
+        const counters = document.querySelectorAll('[class*="input-count__group"]');
+        counters.forEach((counter, idx) => {
+            if (idx === activePackageIndex) {
+                counter.style.outline = '3px solid #005bff';
+                counter.style.outlineOffset = '2px';
+                counter.style.borderRadius = '4px';
+                counter.style.boxShadow = '0 0 8px rgba(0, 91, 255, 0.5)';
+            } else {
+                counter.style.outline = 'none';
+                counter.style.boxShadow = 'none';
+            }
+        });
+    }
+
+    function maintainFocusVisual() {
+        document.querySelectorAll('.smart-control-focus').forEach(el => el.classList.remove('smart-control-focus'));
+        const target = getTargetItem();
+        if (target) target.classList.add('smart-control-focus');
+    }
+
+    function simulateRealClick(element) {
+        if (!element) return;
+        ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click'].forEach(type => {
+            const ev = new MouseEvent(type, { bubbles: true, cancelable: true, view: window, buttons: 1 });
+            element.dispatchEvent(ev);
+        });
+    }
+
+    // --------------------------------------------------------
+    // 7. ОБРАБОТЧИК КЛАВИШ (ШОРТКАТЫ + СТРЕЛКИ)
+    // --------------------------------------------------------
+    window.addEventListener('keydown', function(e) {
+        if (!isOrdersPage()) return;
+
+        // Навигация стрелками (если курсор не в поле ввода)
+        if (!isInputActive()) {
+            if (e.code === 'ArrowDown' || e.code === 'ArrowRight') {
+                e.preventDefault();
+                navigateCards('down');
+                return;
+            }
+            if (e.code === 'ArrowUp' || e.code === 'ArrowLeft') {
+                e.preventDefault();
+                navigateCards('up');
+                return;
+            }
+        }
+
+        const now = Date.now();
+        if (now - lastScanKeyTime > 400) scanBuffer = '';
+        lastScanKeyTime = now;
+
+        if (e.isTrusted && !audioCtx) initAudio();
+
+        if (e.key === 'Escape') {
+            const backSvgPath = document.querySelector('path[d^="M6.293 2.293"]');
+            if (backSvgPath) {
+                const backBtn = backSvgPath.closest('button');
+                if (backBtn) {
+                    e.preventDefault(); e.stopPropagation();
+                    simulateRealClick(backBtn);
+                }
+            }
+            return;
+        }
+
+        if (e.key === 'Enter' && e.code !== KEY_ENTER) {
+            const barcode = scanBuffer.trim();
+            scanBuffer = '';
+            if (barcode.length >= 5) handleBarcodeScan(barcode);
+            return;
+        }
+
+        if (e.key.length === 1 && !e.ctrlKey && !e.altKey && !e.metaKey) {
+            const mappedChar = RUS_TO_ENG[e.key] || e.key;
+            scanBuffer += mappedChar;
+        }
+
+        if (isInputActive() && e.code !== KEY_ENTER) return;
+
+        if (e.code === KEY_MULTIPLY) {
+            e.preventDefault(); e.stopPropagation();
+            activePackageIndex = activePackageIndex === 0 ? 1 : 0;
+            highlightActivePackage();
+            return;
+        }
+
+        if (e.code === KEY_ADD || e.code === KEY_SUBTRACT) {
+            e.preventDefault(); e.stopPropagation();
+            adjustPackage(e.code === KEY_ADD ? 'increment' : 'decrement');
+            return;
+        }
+
+        if (e.code === KEY_CHECK) {
+            e.preventDefault(); e.stopPropagation();
+            numpad0Presses++;
+            if (numpad0Presses === 1) {
+                numpad0Timer = setTimeout(() => { numpad0Presses = 0; }, 400);
+            } else if (numpad0Presses === 2) {
+                clearTimeout(numpad0Timer);
+                numpad0Presses = 0;
+                triggerBtnToCheck();
+            }
+            return;
+        }
+
+        if (REASON_KEYS.includes(e.code)) {
+            e.preventDefault(); e.stopPropagation();
+            const requestedNum = REASON_KEYS.indexOf(e.code) + 1;
+
+            numpadReasonPresses[e.code] = (numpadReasonPresses[e.code] || 0) + 1;
+
+            if (numpadReasonPresses[e.code] === 1) {
+                numpadReasonTimers[e.code] = setTimeout(() => {
+                    numpadReasonPresses[e.code] = 0;
+                }, 400);
+            } else if (numpadReasonPresses[e.code] === 2) {
+                clearTimeout(numpadReasonTimers[e.code]);
+                numpadReasonPresses[e.code] = 0;
+
+                const target = getTargetItem();
+                if (target) {
+                    const success = openDropdownAndSelect(target, requestedNum);
+                    if (success) enterBlockUntil = Date.now() + 2000;
+                }
+            }
+            return;
+        }
+
+        if (e.code === KEY_ENTER) {
+            e.preventDefault(); e.stopPropagation();
+
+            if (isEnterHolding) return;
+
+            const mainBtn = findMainActionButton();
+            if (!mainBtn) return;
+
+            if (Date.now() < enterBlockUntil) {
+                playAnnulateAlert();
+                mainBtn.style.transition = 'background-color 0.1s';
+                mainBtn.style.backgroundColor = '#ff4d4f';
+                setTimeout(() => mainBtn.style.backgroundColor = '', 200);
+                return;
+            }
+
+            const btnText = mainBtn.textContent.trim();
+
+            if (btnText === 'Провести оплату' || btnText === 'Попробовать ещё') {
+                isEnterHolding = true;
+                heldButton = mainBtn;
+
+                heldButton.classList.add('smart-btn-progress');
+                heldButton.classList.remove('done');
+                void heldButton.offsetWidth;
+                heldButton.style.setProperty('--smart-progress', '100%');
+
+                enterHoldTimeout = setTimeout(() => {
+                    heldButton.classList.add('done');
+                    simulateRealClick(heldButton);
+                    isEnterHolding = false;
+                    heldButton = null;
+                }, 400);
+            } else {
+                simulateRealClick(mainBtn);
+            }
+        }
+    }, true);
+
+    window.addEventListener('keyup', function(e) {
+        if (!isOrdersPage()) return;
+
+        if (e.code === KEY_ENTER) {
+            if (isEnterHolding) {
+                clearTimeout(enterHoldTimeout);
+                if (heldButton) {
+                    heldButton.style.setProperty('--smart-progress', '0%');
+                }
+                isEnterHolding = false;
+                heldButton = null;
+            }
+        }
+    }, true);
+
+    // --------------------------------------------------------
+    // 8. СЛУЖЕБНЫЕ ОПЕРАЦИИ ВЫДАЧИ
+    // --------------------------------------------------------
+    function adjustPackage(action) {
+        const counters = document.querySelectorAll('[class*="input-count__group"]');
+        if (counters.length <= activePackageIndex) return;
+        const buttonClass = action === 'increment' ? '[class*="increment"]' : '[class*="decrement"]';
+        const btn = counters[activePackageIndex].querySelector(buttonClass);
+        if (btn && !btn.disabled) simulateRealClick(btn);
+    }
+
+    function findMainActionButton() {
+        const priorities = ['Подтвердить', 'Попробовать ещё', 'Повторить', 'Выдать', 'Продолжить', 'Провести оплату', 'Аннулировать', 'На главную'];
+        const allButtons = Array.from(document.querySelectorAll('button'));
+
+        for (let text of priorities) {
+            const btn = allButtons.find(b => b.textContent.trim() === text && !b.disabled);
+            if (btn) return btn;
+        }
+        return document.querySelector('[data-testid="giveOutActionButton"]');
+    }
+
+    function handleBarcodeScan(barcode) {
+        const now = Date.now();
+        activeBarcode = barcode;
+
+        if (CIS_PATTERN.test(barcode)) {
+            console.log(`[Smart Control] Распознан КИЗ: ${barcode}. Ожидаем ответ Ozon...`);
+        }
+
+        const item = getTargetItem();
+
+        if (barcode === lastScannedBarcode && (now - lastScanTime) < 1500) {
+            console.log(`[Smart Control] Дабл-скан: ${barcode}. Запуск отмены...`);
+            if (item) {
+                item.style.outline = '3px solid #ff4d4f';
+                setTimeout(() => { if (item) item.style.outline = 'none'; }, 500);
+            }
+            const success = openDropdownAndSelect(item, 'DOUBLE_SCAN');
+            if (success) enterBlockUntil = Date.now() + 2000;
+            lastScannedBarcode = '';
+        } else {
+            lastScannedBarcode = barcode;
+            lastScanTime = now;
+        }
+    }
+
+    function triggerBtnToCheck() {
+        const targetItem = getTargetItem();
+        if (!targetItem) return;
+
+        // Защита от сброса аннуляции
+        const isAnnulated = targetItem.querySelector('[data-testid="btnToAnnulate"], [class*="_annulation_"]');
+        if (isAnnulated) {
+            console.warn("[Smart Control] Товар уже аннулирован! Пропуск проверки во избежание сброса статуса.");
+            return;
+        }
+
+        const btn = targetItem.querySelector('[data-testid="btnToCheck"]');
+        if (btn) simulateRealClick(btn);
+    }
+
+    function openDropdownAndSelect(targetItem, requestedNumOrDoubleScan) {
+        if (!targetItem) return false;
+
+        const isDoubleScan = requestedNumOrDoubleScan === 'DOUBLE_SCAN';
+        const requestedNum = typeof requestedNumOrDoubleScan === 'number' ? requestedNumOrDoubleScan : null;
+
+        const selectFromOpenMenu = () => {
+            let targetOption = null;
+
+            if (isDoubleScan) {
+                // Логика двойного скана
+            } else {
+                const badge = document.querySelector(`.numpad-badge-helper[data-reason-num="${requestedNum}"]`);
+                if (badge) {
+                    targetOption = badge.closest('[data-testid^="postingDropDownItemToAnnulate"]');
+                } else {
+                    const options = Array.from(document.querySelectorAll('[data-testid^="postingDropDownItemToAnnulate"]'));
+                    if (options[requestedNum - 1]) targetOption = options[requestedNum - 1];
+                }
+            }
+
+            if (targetOption) {
+                simulateRealClick(targetOption.closest('button') || targetOption.closest('[role="menuitem"]') || targetOption);
+                console.log(`[Smart Control] Причина выбрана!`);
+            }
+        };
+
+        if (document.querySelectorAll('[data-testid^="postingDropDownItemToAnnulate"]').length > 0) {
+            injectReasonNumbers();
+            selectFromOpenMenu();
+            return true;
+        }
+
+        let arrowBtn = null;
+        const splitBtns = targetItem.querySelectorAll('[class*="splitButton"] button');
+
+        if (splitBtns.length >= 2) {
+            arrowBtn = splitBtns[splitBtns.length - 1];
+        } else {
+            const allBtns = Array.from(targetItem.querySelectorAll('button'));
+            arrowBtn = allBtns.find(b => b.querySelector('svg') && !b.textContent.trim() && !b.getAttribute('data-testid')?.match(/btnTo(Check|GiveOut|Annulate|Keep)/i));
+        }
+
+        if (!arrowBtn) return false;
+
+        simulateRealClick(arrowBtn);
+
+        let attempts = 0;
+        const checkDropdown = setInterval(() => {
+            attempts++;
+            if (document.querySelectorAll('[data-testid^="postingDropDownItemToAnnulate"]').length > 0) {
+                clearInterval(checkDropdown);
+                injectReasonNumbers();
+                selectFromOpenMenu();
+            } else if (attempts > 15) {
+                clearInterval(checkDropdown);
+            }
+        }, 100);
+
+        return true;
+    }
+
+})();
