@@ -457,6 +457,36 @@
         }
         .smart-dropdown-item:hover { background: rgba(255, 255, 255, 0.18); }
 
+        @keyframes aggressive-gradient {
+            0%   { background-position: 0% 50%; box-shadow: 0 0 15px rgba(239, 68, 68, 0.7); }
+            50%  { background-position: 100% 50%; box-shadow: 0 0 25px rgba(245, 158, 11, 0.95); }
+            100% { background-position: 0% 50%; box-shadow: 0 0 15px rgba(239, 68, 68, 0.7); }
+        }
+        #smart-exemplar-banner {
+            position: fixed;
+            bottom: 66px;
+            left: 50%;
+            transform: translateX(-50%);
+            background: linear-gradient(270deg, #ff0055, #ff5500, #ffaa00, #ff0055);
+            background-size: 300% 300%;
+            animation: aggressive-gradient 3s ease infinite;
+            color: #ffffff !important;
+            font-weight: 800;
+            font-size: 13px;
+            padding: 6px 16px;
+            border-radius: 12px;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            z-index: 999998;
+            border: 1px solid rgba(255, 255, 255, 0.4);
+            text-shadow: 0 1px 3px rgba(0,0,0,0.6);
+            white-space: nowrap;
+            pointer-events: none;
+            box-sizing: border-box;
+        }
+
+        /* Полоса отката внутри кнопки "Проверить" */
         .smart-btn-countdown-locked {
             position: relative !important;
             overflow: hidden !important;
@@ -468,7 +498,7 @@
             position: absolute;
             top: 0; left: 0; bottom: 0;
             width: 100%;
-            background: rgba(239, 68, 68, 0.4) !important;
+            background: rgba(239, 68, 68, 0.5) !important;
             transition: width 1s linear;
             z-index: 5;
             pointer-events: none;
@@ -497,6 +527,129 @@
             }
         });
     }
+    
+    const audioWarningExemplar = new Audio('https://st.ozone.ru/s3/turbo-pvz-ui-bucket/mp3/warning.mp3');
+    audioWarningExemplar.preload = 'auto';
+
+    function playExemplarWarningSound() {
+        try {
+            audioWarningExemplar.currentTime = 0;
+            audioWarningExemplar.play().catch(() => {});
+        } catch (e) {}
+    }
+
+    // ================= ПЛАШКА НАД ПАНЕЛЬЮ =================
+    function updateExemplarBannerUI() {
+        let hasExemplars = false;
+        document.querySelectorAll('[data-testid="btnToCheck"]').forEach(btn => {
+            if (btn.textContent.includes('•') && btn.textContent.match(/•\s*(\d+)/)) {
+                hasExemplars = true;
+            }
+        });
+
+        let banner = document.getElementById('smart-exemplar-banner');
+
+        if (hasExemplars && isSessionActive()) {
+            if (!banner) {
+                banner = document.createElement('div');
+                banner.id = 'smart-exemplar-banner';
+                banner.innerHTML = `⚠️ ВНИМАНИЕ: В заказе есть товары с несколькими экземплярами!`;
+                document.body.appendChild(banner);
+            }
+        } else {
+            if (banner) banner.remove();
+        }
+    }
+
+    // ================= БОКОВОЕ УВЕДОМЛЕНИЕ О СВЕРКЕ =================
+    function showExemplarSideToast(count) {
+        let toast = document.getElementById('smart-exemplar-side-toast');
+        if (toast) toast.remove();
+
+        toast = document.createElement('div');
+        toast.id = 'smart-exemplar-side-toast';
+        toast.style.cssText = `
+            position: fixed !important;
+            top: 24px !important;
+            right: 24px !important;
+            z-index: 9999999 !important;
+            background: rgba(22, 29, 45, 0.98) !important;
+            border: 2px solid #ef4444 !important;
+            box-shadow: 0 8px 30px rgba(239, 68, 68, 0.45) !important;
+            border-radius: 12px !important;
+            padding: 12px 16px !important;
+            color: #ffffff !important;
+            font-size: 13px !important;
+            max-width: 320px !important;
+            display: flex !important;
+            align-items: flex-start !important;
+            gap: 10px !important;
+            animation: slideUpPanel 0.3s ease-out !important;
+        `;
+        toast.innerHTML = `
+            <span style="font-size: 20px;">⚠️</span>
+            <div>
+                <div style="font-weight: bold; color: #f87171; margin-bottom: 2px;">Проверка количества!</div>
+                <div>В позиции <b>${count} шт.</b> Сверьте фактическое количество с системным перед выдачей!</div>
+            </div>
+        `;
+        document.body.appendChild(toast);
+        setTimeout(() => { if (toast) toast.remove(); }, 8000);
+    }
+
+    // ================= ПЕРЕХВАТ ПЕРВОГО КЛИКА И ОТКАТ НА 10 СЕК =================
+    document.addEventListener('click', function(e) {
+        const btn = e.target.closest('[data-testid="btnToCheck"]');
+        if (!btn) return;
+
+        const match = btn.textContent.match(/•\s*(\d+)/);
+        if (!match) return; // Обычный товар без экземпляров — пропускаем
+
+        // Если кнопка уже прошла 10-секундный откат — разрешаем клик!
+        if (btn.dataset.exemplarState === 'unlocked') {
+            return;
+        }
+
+        // БЛОКИРУЕМ ПЕРВЫЙ КЛИК!
+        e.preventDefault();
+        e.stopPropagation();
+        e.stopImmediatePropagation();
+
+        if (btn.dataset.exemplarState === 'cooling') return;
+
+        const count = match[1];
+        btn.dataset.exemplarState = 'cooling';
+
+        // 1. Звук warning
+        playExemplarWarningSound();
+
+        // 2. Уведомление справа
+        showExemplarSideToast(count);
+
+        // 3. Запуск отката на 10 секунд прямо в кнопке
+        let timeLeft = 10;
+        btn.classList.add('smart-btn-countdown-locked');
+        const originalHtml = btn.innerHTML;
+
+        const bar = document.createElement('div');
+        bar.className = 'smart-btn-countdown-bar';
+        btn.appendChild(bar);
+
+        const cdTimer = setInterval(() => {
+            timeLeft--;
+            bar.style.width = `${(timeLeft / 10) * 100}%`;
+
+            const labelEl = btn.querySelector('[class*="_text_"]') || btn;
+            labelEl.textContent = `Сверьте товар: ${timeLeft} сек`;
+
+            if (timeLeft <= 0) {
+                clearInterval(cdTimer);
+                btn.classList.remove('smart-btn-countdown-locked');
+                btn.innerHTML = originalHtml;
+                btn.dataset.exemplarState = 'unlocked'; // РАЗБЛОКИРОВАНО ДЛЯ ПОВТОРНОГО НАЖАТИЯ!
+            }
+        }, 1000);
+    }, true); // Фаза перехвата (capture: true) перехватывает клик до Озона!
 
     function updateSessionTimerUI() {
         const timerEl = document.getElementById('smart-session-timer');
@@ -730,53 +883,6 @@
         isFocusMode = !isFocusMode;
         document.body.classList.toggle('smart-focus-active', isFocusMode);
         updateStatusSlotUI();
-    }
-
-    // ================= ПРОВЕРКА ЭКЗЕМПЛЯРОВ (БЛОКИРОВКА НА 10 СЕК) =================
-    function checkExemplarButtons() {
-        const checkButtons = document.querySelectorAll('[data-testid="btnToCheck"]');
-
-        checkButtons.forEach(btn => {
-            const card = btn.closest('[class*="_card_"]');
-            if (!card || card.dataset.smartExemplarLocked) return;
-
-            // Ищем паттерн точки "•" и числа в кнопке (например "Проверить • 7 товаров")
-            const text = btn.textContent;
-            const match = text.match(/•\s*(\d+)/);
-
-            if (match) {
-                const count = match[1];
-                card.dataset.smartExemplarLocked = "active"; // Блокируем повторный запуск
-
-                // 1. Показываем всплывающее предупреждение
-                playAnnulateAlert();
-                alert(`⚠️ ВНИМАНИЕ: В позиции несколько экземпляров (${count} шт)!\n\nУбедитесь, что выдаете клиенту ровно ${count} шт физически!`);
-
-                // 2. Блокируем кнопку на 10 секунд и запускаем уменьшающуюся полосу
-                let timeLeft = 10;
-                btn.classList.add('smart-btn-countdown-locked');
-                const originalHtml = btn.innerHTML;
-
-                const bar = document.createElement('div');
-                bar.className = 'smart-btn-countdown-bar';
-                btn.appendChild(bar);
-
-                const countdownInterval = setInterval(() => {
-                    timeLeft--;
-                    bar.style.width = `${(timeLeft / 10) * 100}%`;
-
-                    const labelEl = btn.querySelector('[class*="_text_"]') || btn;
-                    labelEl.textContent = `Проверка через: ${timeLeft} сек`;
-
-                    if (timeLeft <= 0) {
-                        clearInterval(countdownInterval);
-                        btn.classList.remove('smart-btn-countdown-locked');
-                        btn.innerHTML = originalHtml; // Возвращаем исходный вид
-                        card.dataset.smartExemplarLocked = "done";
-                    }
-                }, 1000);
-            }
-        });
     }
 
     function getAllCards() {
@@ -1102,7 +1208,7 @@
         updateSessionTimerUI();
         updateStatusSlotUI();
         updateDynamicButtonsUI();
-        checkExemplarButtons();
+        updateExemplarBannerUI();
         fixKgtShelves();
     }, 200);
 
