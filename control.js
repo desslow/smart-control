@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Ozon Smart Control
 // @namespace    http://tampermonkey.net/
-// @version      8.6
+// @version      8.7
 // @description  Клавиатурный режим выдачи заказов.
 // @author       desslow
 // @match        https://*.ozon.ru/*
@@ -33,13 +33,12 @@
     function handlePostingsData(data, url) {
         if (!data || !Array.isArray(data.postings)) return;
         currentPostingsData = data.postings;
-        const toPay = currentPostingsData.reduce((acc, p) => acc + (p.clientAmount || 0), 0);
 
-        if (toPay > 0) {
-            totalUnpaidDebt = toPay;
+        // Считаем актуальный долг текущего клиента
+        totalUnpaidDebt = currentPostingsData.reduce((acc, p) => acc + (p.clientAmount || 0), 0);
+
+        if (totalUnpaidDebt > 0) {
             triggerScreenPerimeterPulse();
-        } else if (totalUnpaidDebt === 0) {
-            totalUnpaidDebt = 0;
         }
         updateStatusSlotUI();
     }
@@ -439,6 +438,23 @@
             transition: all 0.15s;
         }
         .smart-dropdown-item:hover { background: rgba(255, 255, 255, 0.18); }
+
+        .smart-btn-countdown-locked {
+            position: relative !important;
+            overflow: hidden !important;
+            pointer-events: none !important;
+            filter: grayscale(0.2) !important;
+            cursor: not-allowed !important;
+        }
+        .smart-btn-countdown-bar {
+            position: absolute;
+            top: 0; left: 0; bottom: 0;
+            width: 100%;
+            background: rgba(239, 68, 68, 0.4) !important;
+            transition: width 1s linear;
+            z-index: 5;
+            pointer-events: none;
+        }
     `;
     document.head.appendChild(style);
 
@@ -471,6 +487,7 @@
         const sessionId = getCurrentSessionIdFromUrl();
         if (sessionId && sessionId !== currentSessionId) {
             currentSessionId = sessionId;
+            totalUnpaidDebt = 0;
 
             let foundAtTime = sessionsMap.get(String(sessionId));
             if (!foundAtTime) {
@@ -495,17 +512,21 @@
         timerEl.textContent = `⏱ ${mins}:${secs}`;
     }
 
+    // ================= ДИНАМИЧЕСКИЙ СЛОТ ОПЛАТЫ =================
     function updateStatusSlotUI() {
         const slotEl = document.getElementById('smart-status-slot');
         if (!slotEl) return;
 
+        // 1. ЕСЛИ ВСЕ ОПЛАЧЕНО -> "✓ Оплачено"
         if (totalUnpaidDebt === 0) {
-            slotEl.className = `smart-focus-slot-btn ${isFocusMode ? 'active' : 'inactive'}`;
-            slotEl.innerHTML = `🎯 Фокус: <b>${isFocusMode ? 'ВКЛ' : 'ВЫКЛ'}</b>`;
-            slotEl.onclick = toggleFocusMode;
+            slotEl.className = 'smart-panel-pay pay-clean';
+            slotEl.innerHTML = `✓ Оплачено`;
+            slotEl.title = "Все товары в заказе оплачены";
+            slotEl.onclick = null;
             return;
         }
 
+        // 2. ИЩЕМ, СКОЛЬКО УЖЕ ПИКНУТО ИЗ НЕОПЛАЧЕННЫХ
         let scannedUnpaidSum = 0;
         let hasScannedUnpaid = false;
 
@@ -529,6 +550,7 @@
             }
         });
 
+        // Запасная сверка с виджетом Озона
         if (!hasScannedUnpaid) {
             const nativeWidget = document.querySelector('[class*="_widgetList_"]');
             if (nativeWidget) {
@@ -544,12 +566,16 @@
         }
 
         slotEl.className = 'pay-needed';
-        slotEl.onclick = null;
 
+        // 3. ЕСЛИ УЖЕ ПИКНУТ ТОВАР -> "Сумма: 582/8330 ₽"
         if (hasScannedUnpaid && scannedUnpaidSum > 0) {
-            slotEl.innerHTML = `<span class="pay-dot"></span>К оплате: ${scannedUnpaidSum} ₽`;
-        } else {
+            slotEl.innerHTML = `<span class="pay-dot"></span>Сумма: ${scannedUnpaidSum}/${totalUnpaidDebt} ₽`;
+            slotEl.title = `К списанию за выданные: ${scannedUnpaidSum} ₽ (Всего долг: ${totalUnpaidDebt} ₽)`;
+        }
+        // 4. ДО ПЕРВОГО ПИКНУТОГО -> "Сумма: 8330 ₽"
+        else {
             slotEl.innerHTML = `<span class="pay-dot"></span>Сумма: ${totalUnpaidDebt} ₽`;
+            slotEl.title = "Общий долг по заказу (товары еще не пикнуты)";
         }
     }
 
@@ -686,6 +712,53 @@
         isFocusMode = !isFocusMode;
         document.body.classList.toggle('smart-focus-active', isFocusMode);
         updateStatusSlotUI();
+    }
+
+    // ================= ПРОВЕРКА ЭКЗЕМПЛЯРОВ (БЛОКИРОВКА НА 10 СЕК) =================
+    function checkExemplarButtons() {
+        const checkButtons = document.querySelectorAll('[data-testid="btnToCheck"]');
+
+        checkButtons.forEach(btn => {
+            const card = btn.closest('[class*="_card_"]');
+            if (!card || card.dataset.smartExemplarLocked) return;
+
+            // Ищем паттерн точки "•" и числа в кнопке (например "Проверить • 7 товаров")
+            const text = btn.textContent;
+            const match = text.match(/•\s*(\d+)/);
+
+            if (match) {
+                const count = match[1];
+                card.dataset.smartExemplarLocked = "active"; // Блокируем повторный запуск
+
+                // 1. Показываем всплывающее предупреждение
+                playAnnulateAlert();
+                alert(`⚠️ ВНИМАНИЕ: В позиции несколько экземпляров (${count} шт)!\n\nУбедитесь, что выдаете клиенту ровно ${count} шт физически!`);
+
+                // 2. Блокируем кнопку на 10 секунд и запускаем уменьшающуюся полосу
+                let timeLeft = 10;
+                btn.classList.add('smart-btn-countdown-locked');
+                const originalHtml = btn.innerHTML;
+
+                const bar = document.createElement('div');
+                bar.className = 'smart-btn-countdown-bar';
+                btn.appendChild(bar);
+
+                const countdownInterval = setInterval(() => {
+                    timeLeft--;
+                    bar.style.width = `${(timeLeft / 10) * 100}%`;
+
+                    const labelEl = btn.querySelector('[class*="_text_"]') || btn;
+                    labelEl.textContent = `Проверка через: ${timeLeft} сек`;
+
+                    if (timeLeft <= 0) {
+                        clearInterval(countdownInterval);
+                        btn.classList.remove('smart-btn-countdown-locked');
+                        btn.innerHTML = originalHtml; // Возвращаем исходный вид
+                        card.dataset.smartExemplarLocked = "done";
+                    }
+                }, 1000);
+            }
+        });
     }
 
     function getAllCards() {
@@ -1011,6 +1084,7 @@
         updateSessionTimerUI();
         updateStatusSlotUI();
         updateDynamicButtonsUI();
+        checkExemplarButtons();
         fixKgtShelves();
     }, 200);
 
