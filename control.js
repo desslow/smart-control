@@ -154,6 +154,7 @@
     let lastScanKeyTime = Date.now();
     let enterHoldTimeout = null;
     let isEnterHolding = false;
+    let enterCompleted = false; // Защита от повторного клика при удержании
     let heldButton = null;
     let enterBlockUntil = 0;
 
@@ -865,7 +866,7 @@
 
         if (e.code === KEY_ENTER) {
             e.preventDefault(); e.stopPropagation();
-            if (isEnterHolding) return;
+            if (isEnterHolding || enterCompleted) return; // Игнорируем автоповтор клавиатуры
 
             const mainBtn = findMainActionButton();
             if (!mainBtn) return;
@@ -893,9 +894,11 @@
                     heldButton.classList.add('done');
                     simulateRealClick(heldButton);
                     isEnterHolding = false;
+                    enterCompleted = true; // Блокируем новые нажатия, пока Enter не отпустят руками
                     heldButton = null;
                 }, 400);
             } else {
+                enterCompleted = true;
                 simulateRealClick(mainBtn);
             }
         }
@@ -906,6 +909,7 @@
         if (e.code === 'ControlRight' || e.location === 2) isRightCtrlHeld = false;
 
         if (e.code === KEY_ENTER) {
+            enterCompleted = false; // Сбрасываем флаг, когда физически отпустили клавишу
             if (isEnterHolding) {
                 clearTimeout(enterHoldTimeout);
                 if (heldButton) heldButton.style.setProperty('--smart-progress', '0%');
@@ -996,17 +1000,21 @@
 
     // Надежный поиск главной кнопки действия (с поддержкой Провести оплату и любых сумм)
     function findMainActionButton() {
-        const giveOutBtn = document.querySelector('[data-testid="giveOutActionButton"]');
-        if (giveOutBtn && !giveOutBtn.disabled) return giveOutBtn;
-
-        const priorities = ['Провести оплату', 'Оплатить', 'Подтвердить', 'Попробовать ещё', 'Повторить', 'Выдать', 'Продолжить', 'Аннулировать', 'На главную'];
+        // Приоритеты как в v7.9: модалки -> Выдать -> Оплата -> Аннуляция
+        const priorities = ['Подтвердить', 'Попробовать ещё', 'Повторить', 'Выдать', 'Продолжить', 'Провести оплату', 'Оплатить', 'Аннулировать', 'На главную'];
         const allButtons = Array.from(document.querySelectorAll('button:not([class*="smart-"])'));
 
         for (let text of priorities) {
-            const btn = allButtons.find(b => b.textContent.includes(text) && !b.disabled);
+            const btn = allButtons.find(b => {
+                if (b.disabled || b.getAttribute('aria-disabled') === 'true') return false;
+                const t = b.textContent.trim();
+                return t === text || t.startsWith(text);
+            });
             if (btn) return btn;
         }
-        return giveOutBtn;
+
+        const fallback = document.querySelector('[data-testid="giveOutActionButton"]');
+        return (fallback && !fallback.disabled && fallback.getAttribute('aria-disabled') !== 'true') ? fallback : null;
     }
 
     function handleBarcodeScan(barcode) {
@@ -1228,7 +1236,5 @@
             const ev = new MouseEvent(type, { bubbles: true, cancelable: true, view: window, buttons: 1 });
             element.dispatchEvent(ev);
         });
-        try { element.click(); } catch(e) {}
     }
-
 })();
