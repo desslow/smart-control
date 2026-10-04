@@ -22,9 +22,12 @@
     function handleSessionsData(data) {
         if (!data || !Array.isArray(data.sessions)) return;
         data.sessions.forEach(s => {
-            if (s.sessionId && s.foundAt) {
-                const ts = new Date(s.foundAt).getTime();
-                sessionsMap.set(String(s.sessionId), ts);
+            if (s.sessionId) {
+                const ts = s.foundAt ? new Date(s.foundAt).getTime() : Date.now();
+                sessionsMap.set(String(s.sessionId), {
+                    foundAt: ts,
+                    allPrepaid: s.allPrepaid === true // Флаг предоплаты от Озона
+                });
                 localStorage.setItem(`ozon_found_at_${s.sessionId}`, String(ts));
             }
         });
@@ -34,12 +37,13 @@
         if (!data || !Array.isArray(data.postings)) return;
         currentPostingsData = data.postings;
 
-        // Считаем актуальный долг текущего клиента
-        totalUnpaidDebt = currentPostingsData.reduce((acc, p) => acc + (p.clientAmount || 0), 0);
+        const toPay = currentPostingsData.reduce((acc, p) => acc + (p.clientAmount || 0), 0);
 
-        if (totalUnpaidDebt > 0) {
+        if (toPay > 0) {
+            totalUnpaidDebt = toPay;
             triggerScreenPerimeterPulse();
         }
+
         updateStatusSlotUI();
     }
 
@@ -488,6 +492,7 @@
         if (sessionId && sessionId !== currentSessionId) {
             currentSessionId = sessionId;
             totalUnpaidDebt = 0;
+            currentPostingsData = null;
 
             let foundAtTime = sessionsMap.get(String(sessionId));
             if (!foundAtTime) {
@@ -513,20 +518,23 @@
     }
 
     // ================= ДИНАМИЧЕСКИЙ СЛОТ ОПЛАТЫ =================
+    // ================= ДИНАМИЧЕСКИЙ СЛОТ: ОПЛАТА И СУММА =================
     function updateStatusSlotUI() {
         const slotEl = document.getElementById('smart-status-slot');
         if (!slotEl) return;
 
-        // 1. ЕСЛИ ВСЕ ОПЛАЧЕНО -> "✓ Оплачено"
-        if (totalUnpaidDebt === 0) {
+        const sessInfo = sessionsMap.get(String(currentSessionId));
+        const isPrepaidOrder = (sessInfo && sessInfo.allPrepaid) || (totalUnpaidDebt === 0);
+
+        // 1. ЕСЛИ ЗАКАЗ ПОЛНОСТЬЮ ОПЛАЧЕН
+        if (isPrepaidOrder && totalUnpaidDebt === 0) {
             slotEl.className = 'smart-panel-pay pay-clean';
             slotEl.innerHTML = `✓ Оплачено`;
             slotEl.title = "Все товары в заказе оплачены";
-            slotEl.onclick = null;
             return;
         }
 
-        // 2. ИЩЕМ, СКОЛЬКО УЖЕ ПИКНУТО ИЗ НЕОПЛАЧЕННЫХ
+        // 2. СЧИТАЕМ СУММУ ТОВАРОВ, КОТОРЫЕ УЖЕ ГОТОВЫ К ВЫДАЧЕ
         let scannedUnpaidSum = 0;
         let hasScannedUnpaid = false;
 
@@ -550,7 +558,7 @@
             }
         });
 
-        // Запасная сверка с виджетом Озона
+        // Запасная сверка с виджетом самого Озона в правом углу
         if (!hasScannedUnpaid) {
             const nativeWidget = document.querySelector('[class*="_widgetList_"]');
             if (nativeWidget) {
@@ -567,15 +575,13 @@
 
         slotEl.className = 'pay-needed';
 
-        // 3. ЕСЛИ УЖЕ ПИКНУТ ТОВАР -> "Сумма: 582/8330 ₽"
         if (hasScannedUnpaid && scannedUnpaidSum > 0) {
             slotEl.innerHTML = `<span class="pay-dot"></span>Сумма: ${scannedUnpaidSum}/${totalUnpaidDebt} ₽`;
-            slotEl.title = `К списанию за выданные: ${scannedUnpaidSum} ₽ (Всего долг: ${totalUnpaidDebt} ₽)`;
+            slotEl.title = `К списанию сейчас: ${scannedUnpaidSum} ₽ (Общий долг: ${totalUnpaidDebt} ₽)`;
         }
-        // 4. ДО ПЕРВОГО ПИКНУТОГО -> "Сумма: 8330 ₽"
         else {
             slotEl.innerHTML = `<span class="pay-dot"></span>Сумма: ${totalUnpaidDebt} ₽`;
-            slotEl.title = "Общий долг по заказу (товары еще не пикнуты)";
+            slotEl.title = "Общий долг по заказу (товары еще не проверены)";
         }
     }
 
