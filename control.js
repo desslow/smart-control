@@ -378,6 +378,20 @@
             border-radius: 50%;
             animation: blink-dot 0.8s infinite ease-in-out;
         }
+        .pay-clean {
+            background: rgba(16, 185, 129, 0.16) !important;
+            color: #10b981 !important;
+            border: 1px solid rgba(16, 185, 129, 0.4) !important;
+            border-radius: 6px !important;
+            padding: 4px 8px !important;
+            font-size: 12px !important;
+            font-weight: bold !important;
+            white-space: nowrap !important;
+            display: flex !important;
+            align-items: center !important;
+            gap: 5px !important;
+            box-shadow: 0 0 10px rgba(16, 185, 129, 0.25) !important;
+        }
 
         .smart-focus-slot-btn {
             font-size: 12px;
@@ -517,8 +531,6 @@
         timerEl.textContent = `⏱ ${mins}:${secs}`;
     }
 
-    // ================= ДИНАМИЧЕСКИЙ СЛОТ ОПЛАТЫ =================
-    // ================= ДИНАМИЧЕСКИЙ СЛОТ: ОПЛАТА И СУММА =================
     function updateStatusSlotUI() {
         const slotEl = document.getElementById('smart-status-slot');
         if (!slotEl) return;
