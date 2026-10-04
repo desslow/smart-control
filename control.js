@@ -1,9 +1,9 @@
 // ==UserScript==
 // @name         Ozon Smart Control
 // @namespace    http://tampermonkey.net/
-// @version      8.7
+// @version      8.6
 // @description  Клавиатурный режим выдачи заказов.
-// @author       desslow
+// @author       desslow & assistant
 // @match        https://*.ozon.ru/*
 // @run-at       document-start
 // @grant        none
@@ -12,7 +12,6 @@
 (function() {
     'use strict';
 
-    // xhr observer
     window._ozonAuthHeaders = null;
     let sessionsMap = new Map();
     let currentPostingsData = null;
@@ -109,8 +108,14 @@
         }
     };
 
-    function isSessionPage() {
-        return window.location.pathname.startsWith('/orders/session');
+    // 1. Для работы клавиатуры (как в v7.9)
+    function isOrdersPage() {
+        const path = window.location.pathname;
+        return path.includes('/orders') && !path.includes('/outbound');
+    }
+
+    function isSessionActive() {
+        return window.location.pathname.includes('/orders/session');
     }
 
     function getCurrentSessionIdFromUrl() {
@@ -118,7 +123,27 @@
         return match ? match[1] : null;
     }
 
-    // ================= СОСТОЯНИЕ =================
+    const KEY_ENTER = 'NumpadEnter';
+    const KEY_ADD = 'NumpadAdd';
+    const KEY_SUBTRACT = 'NumpadSubtract';
+    const KEY_MULTIPLY = 'NumpadMultiply';
+    const KEY_CHECK = 'Numpad0';
+    const REASON_KEYS = ['Numpad1', 'Numpad2', 'Numpad3', 'Numpad4', 'Numpad5'];
+
+    const RUS_TO_ENG = {
+        'й': 'q', 'ц': 'w', 'у': 'e', 'к': 'r', 'е': 't', 'н': 'y', 'г': 'u', 'ш': 'i', 'щ': 'o', 'з': 'p',
+        'х': '[', 'ъ': ']', 'ф': 'a', 'ы': 's', 'в': 'd', 'а': 'f', 'п': 'g', 'р': 'h', 'о': 'j', 'л': 'k',
+        'д': 'l', 'ж': ';', 'э': "'", 'я': 'z', 'ч': 'x', 'с': 'c', 'м': 'v', 'и': 'b', 'т': 'n', 'ь': 'm',
+        'б': ',', 'ю': '.', '.': '/', 'Ё': '~', 'ё': '`',
+        'Й': 'Q', 'Ц': 'W', 'У': 'E', 'К': 'R', 'Е': 'T', 'Н': 'Y', 'Г': 'U', 'Ш': 'I', 'Щ': 'O', 'З': 'P',
+        'Х': '{', 'Ъ': '}', 'Ф': 'A', 'Ы': 'S', 'В': 'D', 'А': 'F', 'П': 'G', 'Р': 'H', 'О': 'J', 'Л': 'K',
+        'Д': 'L', 'Ж': ':', 'Э': '"', 'Я': 'Z', 'Ч': 'X', 'С': 'C', 'М': 'V', 'И': 'B', 'Т': 'N', 'Ь': 'M',
+        'Б': '<', 'Ю': '>', ',': '?'
+    };
+
+    const CIS_PATTERN = /^[^a-zA-Z0-9]*01\d{13,14}21.+$/;
+
+    // Состояние скрипта
     let activePackageIndex = 0;
     let activeBarcode = '';
     let lastScannedBarcode = '';
@@ -141,16 +166,14 @@
     let isMouseDown = false;
     let isDraggingSelection = false;
 
-    // focus-mode
+    // Фокус-мод
     let isFocusMode = false;
     let rCtrlPresses = 0;
     let rCtrlTimer = null;
     let isRightCtrlHeld = false;
 
-    // styles
     const style = document.createElement('style');
     style.innerHTML = `
-        /* Запрет системного выделения текста */
         [class*="_card_"], [class*="_item_"], #smart-control-panel {
             user-select: none !important;
             -webkit-user-select: none !important;
@@ -160,7 +183,7 @@
             -webkit-user-select: none !important;
         }
 
-        /* Плавная анимация появления панели снизу вверх */
+        /* Плавное выплывание панели снизу вверх */
         @keyframes slideUpPanel {
             0% {
                 opacity: 0;
@@ -252,7 +275,7 @@
             text-overflow: ellipsis !important;
         }
 
-        /* Пульсация по периметру экрана на родительском контейнере */
+        /* Пульсация по периметру экрана */
         @keyframes perimeter-glow-flash {
             0%   { box-shadow: inset 0 0 0px rgba(239, 68, 68, 0); }
             50%  { box-shadow: inset 0 0 45px rgba(239, 68, 68, 0.9), inset 0 0 90px rgba(239, 68, 68, 0.5); }
@@ -261,6 +284,15 @@
         .smart-perimeter-pulse {
             animation: perimeter-glow-flash 0.5s ease-in-out !important;
         }
+
+        /* Анимация прогресса удержания кнопки Enter */
+        .smart-btn-progress { position: relative !important; overflow: hidden !important; }
+        .smart-btn-progress::after {
+            content: ''; position: absolute; top: 0; left: 0; bottom: 0;
+            width: var(--smart-progress, 0%); background-color: rgba(228, 0, 124, 0.55) !important;
+            transition: width 0.4s linear, opacity 0.2s ease-out; pointer-events: none; z-index: 10; border-radius: inherit;
+        }
+        .smart-btn-progress.done::after { opacity: 0; }
 
         .smart-panel-btn {
             color: #ffffff;
@@ -343,7 +375,6 @@
             animation: blink-dot 0.8s infinite ease-in-out;
         }
 
-        /* Индикатор фокус-мода */
         .smart-focus-slot-btn {
             font-size: 12px;
             font-weight: 600;
@@ -410,7 +441,6 @@
     `;
     document.head.appendChild(style);
 
-    // perimeter
     function triggerScreenPerimeterPulse() {
         const content = document.querySelector('[class*="_content_"]') || document.querySelector('[class*="_page_"]');
         const target = (content && content.parentElement) || content || document.body;
@@ -421,7 +451,6 @@
         setTimeout(() => target.classList.remove('smart-perimeter-pulse'), 550);
     }
 
-    // kgt-fix
     function fixKgtShelves() {
         document.querySelectorAll('[class*="_addressBadge_"]').forEach(badge => {
             const text = badge.textContent.trim();
@@ -434,7 +463,6 @@
         });
     }
 
-    // session timer
     function updateSessionTimerUI() {
         const timerEl = document.getElementById('smart-session-timer');
         if (!timerEl) return;
@@ -466,7 +494,6 @@
         timerEl.textContent = `⏱ ${mins}:${secs}`;
     }
 
-    // dynamic slot
     function updateStatusSlotUI() {
         const slotEl = document.getElementById('smart-status-slot');
         if (!slotEl) return;
@@ -525,9 +552,8 @@
         }
     }
 
-    // panel
     function injectControlPanel() {
-        if (!isSessionPage()) {
+        if (!isSessionActive()) {
             const existing = document.getElementById('smart-control-panel');
             if (existing) existing.remove();
             return;
@@ -595,7 +621,6 @@
         updateStatusSlotUI();
     }
 
-    // search  similar
     function isSimilarNames(s1, s2) {
         s1 = s1.toLowerCase().replace(/[^a-zа-я0-9]/gi, ' ').replace(/\s+/g, ' ').trim();
         s2 = s2.toLowerCase().replace(/[^a-zа-я0-9]/gi, ' ').replace(/\s+/g, ' ').trim();
@@ -633,16 +658,12 @@
         });
     }
 
-    // blur focus mode
     function toggleFocusMode() {
         isFocusMode = !isFocusMode;
         document.body.classList.toggle('smart-focus-active', isFocusMode);
         updateStatusSlotUI();
-        console.log(`[Smart Control] 🎯 Фокус-мод (Blur): ${isFocusMode ? 'ВКЛ' : 'ВЫКЛ'}`);
     }
 
-    // mass actions
-    // eternity selector cards
     function getAllCards() {
         const wrappers = Array.from(document.querySelectorAll('[data-testid="postingContentWrapper"]'));
         if (wrappers.length > 0) {
@@ -673,7 +694,7 @@
 
         const splitBtns = card.querySelectorAll('[class*="splitButton"] button');
         let arrowBtn = splitBtns.length >= 2 ? splitBtns[splitBtns.length - 1] : null;
-        if (!arrowBtn) arrowBtn = Array.from(card.querySelectorAll('button')).find(b => b.querySelector('svg') && !b.textContent.trim());
+        if (!arrowBtn) arrowBtn = Array.from(card.querySelectorAll('button:not([class*="smart-"])')).find(b => b.querySelector('svg') && !b.textContent.trim());
 
         if (!arrowBtn) return;
         simulateRealClick(arrowBtn);
@@ -719,11 +740,11 @@
         }
     }
 
-    // shortcuts
     window.addEventListener('keydown', function(e) {
-        if (!isSessionPage()) return;
+        // РАБОТАЕТ ВЕЗДЕ НА СТРАНИЦЕ ЗАКАЗОВ (как в v7.9)
+        if (!isOrdersPage()) return;
 
-        // double rctrl
+        // ДВОЙНОЙ RCTRL (ФОКУС-МОД)
         if (e.code === 'ControlRight' || (e.ctrlKey && e.location === 2)) {
             isRightCtrlHeld = true;
             rCtrlPresses++;
@@ -736,7 +757,7 @@
             }
         }
 
-        // space selection
+        // ВЫДЕЛЕНИЕ НА ПРОБЕЛ
         if (e.code === 'Space') {
             if (isInputActive()) return;
             e.preventDefault();
@@ -746,7 +767,7 @@
             return;
         }
 
-        // binds rctrl + 1...7
+        // БИНДЫ RCTRL + 1..7
         if (isRightCtrlHeld || (e.ctrlKey && e.location === 2)) {
             if (e.code === 'Digit1' || e.code === 'Numpad1') { e.preventDefault(); e.stopPropagation(); massExecute('check'); }
             else if (e.code === 'Digit2' || e.code === 'Numpad2') { e.preventDefault(); e.stopPropagation(); massExecute('giveout'); }
@@ -756,15 +777,146 @@
             else if (e.code === 'Digit6' || e.code === 'Numpad6') { e.preventDefault(); e.stopPropagation(); selectAllCards(true); }
             else if (e.code === 'Digit7' || e.code === 'Numpad7') { e.preventDefault(); e.stopPropagation(); selectAllCards(false); }
         }
+
+        // СТРЕЛКИ
+        if (!isInputActive() && !isRightCtrlHeld && e.code !== 'Space') {
+            if (e.code === 'ArrowDown' || e.code === 'ArrowRight') {
+                e.preventDefault(); navigateCards('down'); return;
+            }
+            if (e.code === 'ArrowUp' || e.code === 'ArrowLeft') {
+                e.preventDefault(); navigateCards('up'); return;
+            }
+        }
+
+        const now = Date.now();
+        if (now - lastScanKeyTime > 400) scanBuffer = '';
+        lastScanKeyTime = now;
+
+        if (e.isTrusted && !audioCtx) initAudio();
+
+        if (e.key === 'Escape') {
+            const backSvgPath = document.querySelector('path[d^="M6.293 2.293"]');
+            if (backSvgPath) {
+                const backBtn = backSvgPath.closest('button');
+                if (backBtn) { e.preventDefault(); e.stopPropagation(); simulateRealClick(backBtn); }
+            }
+            return;
+        }
+
+        if (e.key === 'Enter' && e.code !== KEY_ENTER) {
+            const barcode = scanBuffer.trim();
+            scanBuffer = '';
+            if (barcode.length >= 5) handleBarcodeScan(barcode);
+            return;
+        }
+
+        if (e.key.length === 1 && !e.ctrlKey && !e.altKey && !e.metaKey) {
+            const mappedChar = RUS_TO_ENG[e.key] || e.key;
+            scanBuffer += mappedChar;
+        }
+
+        if (isInputActive() && e.code !== KEY_ENTER) return;
+
+        if (e.code === KEY_MULTIPLY) {
+            e.preventDefault(); e.stopPropagation();
+            activePackageIndex = activePackageIndex === 0 ? 1 : 0;
+            highlightActivePackage();
+            return;
+        }
+
+        if (e.code === KEY_ADD || e.code === KEY_SUBTRACT) {
+            e.preventDefault(); e.stopPropagation();
+            adjustPackage(e.code === KEY_ADD ? 'increment' : 'decrement');
+            return;
+        }
+
+        if (e.code === KEY_CHECK) {
+            e.preventDefault(); e.stopPropagation();
+            numpad0Presses++;
+            if (numpad0Presses === 1) {
+                numpad0Timer = setTimeout(() => { numpad0Presses = 0; }, 400);
+            } else if (numpad0Presses === 2) {
+                clearTimeout(numpad0Timer);
+                numpad0Presses = 0;
+                triggerBtnToCheck();
+            }
+            return;
+        }
+
+        if (REASON_KEYS.includes(e.code)) {
+            e.preventDefault(); e.stopPropagation();
+            const requestedNum = REASON_KEYS.indexOf(e.code) + 1;
+            numpadReasonPresses[e.code] = (numpadReasonPresses[e.code] || 0) + 1;
+
+            if (numpadReasonPresses[e.code] === 1) {
+                numpadReasonTimers[e.code] = setTimeout(() => { numpadReasonPresses[e.code] = 0; }, 400);
+            } else if (numpadReasonPresses[e.code] === 2) {
+                clearTimeout(numpadReasonTimers[e.code]);
+                numpadReasonPresses[e.code] = 0;
+
+                const target = getTargetItem();
+                if (target) {
+                    const success = openDropdownAndSelect(target, requestedNum);
+                    if (success) enterBlockUntil = Date.now() + 2000;
+                }
+            }
+            return;
+        }
+
+        if (e.code === KEY_ENTER) {
+            e.preventDefault(); e.stopPropagation();
+            if (isEnterHolding) return;
+
+            const mainBtn = findMainActionButton();
+            if (!mainBtn) return;
+
+            if (Date.now() < enterBlockUntil) {
+                playAnnulateAlert();
+                mainBtn.style.transition = 'background-color 0.1s';
+                mainBtn.style.backgroundColor = '#ff4d4f';
+                setTimeout(() => mainBtn.style.backgroundColor = '', 200);
+                return;
+            }
+
+            const btnText = mainBtn.textContent.trim();
+            const isPaymentOrRetry = btnText.includes('Провести оплату') || btnText.includes('Попробовать ещё') || btnText.includes('Оплатить');
+
+            if (isPaymentOrRetry) {
+                isEnterHolding = true;
+                heldButton = mainBtn;
+                heldButton.classList.add('smart-btn-progress');
+                heldButton.classList.remove('done');
+                void heldButton.offsetWidth;
+                heldButton.style.setProperty('--smart-progress', '100%');
+
+                enterHoldTimeout = setTimeout(() => {
+                    heldButton.classList.add('done');
+                    simulateRealClick(heldButton);
+                    isEnterHolding = false;
+                    heldButton = null;
+                }, 400);
+            } else {
+                simulateRealClick(mainBtn);
+            }
+        }
     }, true);
 
     window.addEventListener('keyup', function(e) {
+        if (!isOrdersPage()) return;
         if (e.code === 'ControlRight' || e.location === 2) isRightCtrlHeld = false;
+
+        if (e.code === KEY_ENTER) {
+            if (isEnterHolding) {
+                clearTimeout(enterHoldTimeout);
+                if (heldButton) heldButton.style.setProperty('--smart-progress', '0%');
+                isEnterHolding = false;
+                heldButton = null;
+            }
+        }
     }, true);
 
-    // drug lmb
     window.addEventListener('mousedown', function(e) {
-        if (!isSessionPage()) return;
+        if (!isOrdersPage()) return;
         if (e.button !== 0) return;
         if (e.target.closest('button, input, textarea, a, svg, #smart-control-panel, #smart-more-dropdown')) return;
 
@@ -784,7 +936,7 @@
 
     window.addEventListener('mouseup', function(e) {
         document.body.classList.remove('smart-no-select');
-        if (!isSessionPage()) return;
+        if (!isOrdersPage()) return;
 
         if (isMouseDown && !isDraggingSelection && e.button === 0) {
             if (!e.target.closest('button, input, textarea, a, svg, #smart-control-panel, #smart-more-dropdown')) {
@@ -796,7 +948,6 @@
         setTimeout(() => { isDraggingSelection = false; }, 50);
     }, true);
 
-    // arrows
     function navigateCards(direction) {
         const cards = getAllCards();
         if (cards.length === 0) return;
@@ -820,9 +971,8 @@
         newTarget.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
     }
 
-    // main
     setInterval(() => {
-        if (!isSessionPage()) {
+        if (!isOrdersPage()) {
             const p = document.getElementById('smart-control-panel');
             if (p) p.remove();
             return;
@@ -836,7 +986,106 @@
         fixKgtShelves();
     }, 200);
 
-    // sc-side
+    function adjustPackage(action) {
+        const counters = document.querySelectorAll('[class*="input-count__group"]');
+        if (counters.length <= activePackageIndex) return;
+        const buttonClass = action === 'increment' ? '[class*="increment"]' : '[class*="decrement"]';
+        const btn = counters[activePackageIndex].querySelector(buttonClass);
+        if (btn && !btn.disabled) simulateRealClick(btn);
+    }
+
+    // Надежный поиск главной кнопки действия (с поддержкой Провести оплату и любых сумм)
+    function findMainActionButton() {
+        const giveOutBtn = document.querySelector('[data-testid="giveOutActionButton"]');
+        if (giveOutBtn && !giveOutBtn.disabled) return giveOutBtn;
+
+        const priorities = ['Провести оплату', 'Оплатить', 'Подтвердить', 'Попробовать ещё', 'Повторить', 'Выдать', 'Продолжить', 'Аннулировать', 'На главную'];
+        const allButtons = Array.from(document.querySelectorAll('button:not([class*="smart-"])'));
+
+        for (let text of priorities) {
+            const btn = allButtons.find(b => b.textContent.includes(text) && !b.disabled);
+            if (btn) return btn;
+        }
+        return giveOutBtn;
+    }
+
+    function handleBarcodeScan(barcode) {
+        const now = Date.now();
+        activeBarcode = barcode;
+        if (CIS_PATTERN.test(barcode)) console.log(`[Smart Control] Распознан КИЗ: ${barcode}.`);
+        const item = getTargetItem();
+        if (barcode === lastScannedBarcode && (now - lastScanTime) < 1500) {
+            if (item) {
+                item.style.outline = '3px solid #ff4d4f';
+                setTimeout(() => { if (item) item.style.outline = 'none'; }, 500);
+            }
+            const success = openDropdownAndSelect(item, 'DOUBLE_SCAN');
+            if (success) enterBlockUntil = Date.now() + 2000;
+            lastScannedBarcode = '';
+        } else {
+            lastScannedBarcode = barcode;
+            lastScanTime = now;
+        }
+    }
+
+    function triggerBtnToCheck() {
+        const targetItem = getTargetItem();
+        if (!targetItem) return;
+        const isAnnulated = targetItem.querySelector('[data-testid="btnToAnnulate"], [class*="_annulation_"]');
+        if (isAnnulated) return;
+        const btn = targetItem.querySelector('[data-testid="btnToCheck"]');
+        if (btn) simulateRealClick(btn);
+    }
+
+    function openDropdownAndSelect(targetItem, requestedNumOrDoubleScan) {
+        if (!targetItem) return false;
+        const isDoubleScan = requestedNumOrDoubleScan === 'DOUBLE_SCAN';
+        const requestedNum = typeof requestedNumOrDoubleScan === 'number' ? requestedNumOrDoubleScan : null;
+
+        const selectFromOpenMenu = () => {
+            let targetOption = null;
+            if (!isDoubleScan) {
+                const badge = document.querySelector(`.numpad-badge-helper[data-reason-num="${requestedNum}"]`);
+                if (badge) targetOption = badge.closest('[data-testid^="postingDropDownItemToAnnulate"]');
+                else {
+                    const options = Array.from(document.querySelectorAll('[data-testid^="postingDropDownItemToAnnulate"]'));
+                    if (options[requestedNum - 1]) targetOption = options[requestedNum - 1];
+                }
+            }
+            if (targetOption) simulateRealClick(targetOption.closest('button') || targetOption.closest('[role="menuitem"]') || targetOption);
+        };
+
+        if (document.querySelectorAll('[data-testid^="postingDropDownItemToAnnulate"]').length > 0) {
+            injectReasonNumbers();
+            selectFromOpenMenu();
+            return true;
+        }
+
+        let arrowBtn = null;
+        const splitBtns = targetItem.querySelectorAll('[class*="splitButton"] button');
+        if (splitBtns.length >= 2) arrowBtn = splitBtns[splitBtns.length - 1];
+        else {
+            arrowBtn = Array.from(targetItem.querySelectorAll('button:not([class*="smart-"])')).find(b => b.querySelector('svg') && !b.textContent.trim() && !b.getAttribute('data-testid')?.match(/btnTo(Check|GiveOut|Annulate|Keep)/i));
+        }
+
+        if (!arrowBtn) return false;
+        simulateRealClick(arrowBtn);
+
+        let attempts = 0;
+        const checkDropdown = setInterval(() => {
+            attempts++;
+            if (document.querySelectorAll('[data-testid^="postingDropDownItemToAnnulate"]').length > 0) {
+                clearInterval(checkDropdown);
+                injectReasonNumbers();
+                selectFromOpenMenu();
+            } else if (attempts > 15) {
+                clearInterval(checkDropdown);
+            }
+        }, 100);
+
+        return true;
+    }
+
     function injectReasonNumbers() {
         const dropdownItems = document.querySelectorAll('[data-testid^="postingDropDownItemToAnnulate"]');
         if (dropdownItems.length === 0) return;
@@ -979,238 +1228,7 @@
             const ev = new MouseEvent(type, { bubbles: true, cancelable: true, view: window, buttons: 1 });
             element.dispatchEvent(ev);
         });
-    }
-
-    // shorts for numpad & scanner
-    window.addEventListener('keydown', function(e) {
-        if (!isSessionPage()) return;
-
-        if (!isInputActive() && !isRightCtrlHeld && e.code !== 'Space') {
-            if (e.code === 'ArrowDown' || e.code === 'ArrowRight') {
-                e.preventDefault(); navigateCards('down'); return;
-            }
-            if (e.code === 'ArrowUp' || e.code === 'ArrowLeft') {
-                e.preventDefault(); navigateCards('up'); return;
-            }
-        }
-
-        const now = Date.now();
-        if (now - lastScanKeyTime > 400) scanBuffer = '';
-        lastScanKeyTime = now;
-
-        if (e.isTrusted && !audioCtx) initAudio();
-
-        if (e.key === 'Escape') {
-            const backSvgPath = document.querySelector('path[d^="M6.293 2.293"]');
-            if (backSvgPath) {
-                const backBtn = backSvgPath.closest('button');
-                if (backBtn) { e.preventDefault(); e.stopPropagation(); simulateRealClick(backBtn); }
-            }
-            return;
-        }
-
-        if (e.key === 'Enter' && e.code !== KEY_ENTER) {
-            const barcode = scanBuffer.trim();
-            scanBuffer = '';
-            if (barcode.length >= 5) handleBarcodeScan(barcode);
-            return;
-        }
-
-        if (e.key.length === 1 && !e.ctrlKey && !e.altKey && !e.metaKey) {
-            const mappedChar = RUS_TO_ENG[e.key] || e.key;
-            scanBuffer += mappedChar;
-        }
-
-        if (isInputActive() && e.code !== KEY_ENTER) return;
-
-        if (e.code === KEY_MULTIPLY) {
-            e.preventDefault(); e.stopPropagation();
-            activePackageIndex = activePackageIndex === 0 ? 1 : 0;
-            highlightActivePackage();
-            return;
-        }
-
-        if (e.code === KEY_ADD || e.code === KEY_SUBTRACT) {
-            e.preventDefault(); e.stopPropagation();
-            adjustPackage(e.code === KEY_ADD ? 'increment' : 'decrement');
-            return;
-        }
-
-        if (e.code === KEY_CHECK) {
-            e.preventDefault(); e.stopPropagation();
-            numpad0Presses++;
-            if (numpad0Presses === 1) {
-                numpad0Timer = setTimeout(() => { numpad0Presses = 0; }, 400);
-            } else if (numpad0Presses === 2) {
-                clearTimeout(numpad0Timer);
-                numpad0Presses = 0;
-                triggerBtnToCheck();
-            }
-            return;
-        }
-
-        if (REASON_KEYS.includes(e.code)) {
-            e.preventDefault(); e.stopPropagation();
-            const requestedNum = REASON_KEYS.indexOf(e.code) + 1;
-            numpadReasonPresses[e.code] = (numpadReasonPresses[e.code] || 0) + 1;
-
-            if (numpadReasonPresses[e.code] === 1) {
-                numpadReasonTimers[e.code] = setTimeout(() => { numpadReasonPresses[e.code] = 0; }, 400);
-            } else if (numpadReasonPresses[e.code] === 2) {
-                clearTimeout(numpadReasonTimers[e.code]);
-                numpadReasonPresses[e.code] = 0;
-
-                const target = getTargetItem();
-                if (target) {
-                    const success = openDropdownAndSelect(target, requestedNum);
-                    if (success) enterBlockUntil = Date.now() + 2000;
-                }
-            }
-            return;
-        }
-
-        if (e.code === KEY_ENTER) {
-            e.preventDefault(); e.stopPropagation();
-            if (isEnterHolding) return;
-
-            const mainBtn = findMainActionButton();
-            if (!mainBtn) return;
-
-            if (Date.now() < enterBlockUntil) {
-                playAnnulateAlert();
-                mainBtn.style.transition = 'background-color 0.1s';
-                mainBtn.style.backgroundColor = '#ff4d4f';
-                setTimeout(() => mainBtn.style.backgroundColor = '', 200);
-                return;
-            }
-
-            const btnText = mainBtn.textContent.trim();
-            if (btnText === 'Провести оплату' || btnText === 'Попробовать ещё') {
-                isEnterHolding = true;
-                heldButton = mainBtn;
-                heldButton.classList.add('smart-btn-progress');
-                heldButton.classList.remove('done');
-                void heldButton.offsetWidth;
-                heldButton.style.setProperty('--smart-progress', '100%');
-
-                enterHoldTimeout = setTimeout(() => {
-                    heldButton.classList.add('done');
-                    simulateRealClick(heldButton);
-                    isEnterHolding = false;
-                    heldButton = null;
-                }, 400);
-            } else {
-                simulateRealClick(mainBtn);
-            }
-        }
-    }, true);
-
-    window.addEventListener('keyup', function(e) {
-        if (!isSessionPage()) return;
-        if (e.code === KEY_ENTER) {
-            if (isEnterHolding) {
-                clearTimeout(enterHoldTimeout);
-                if (heldButton) heldButton.style.setProperty('--smart-progress', '0%');
-                isEnterHolding = false;
-                heldButton = null;
-            }
-        }
-    }, true);
-
-    function adjustPackage(action) {
-        const counters = document.querySelectorAll('[class*="input-count__group"]');
-        if (counters.length <= activePackageIndex) return;
-        const buttonClass = action === 'increment' ? '[class*="increment"]' : '[class*="decrement"]';
-        const btn = counters[activePackageIndex].querySelector(buttonClass);
-        if (btn && !btn.disabled) simulateRealClick(btn);
-    }
-
-    function findMainActionButton() {
-        const priorities = ['Подтвердить', 'Попробовать ещё', 'Повторить', 'Выдать', 'Продолжить', 'Провести оплату', 'Аннулировать', 'На главную'];
-        const allButtons = Array.from(document.querySelectorAll('button'));
-        for (let text of priorities) {
-            const btn = allButtons.find(b => b.textContent.trim() === text && !b.disabled);
-            if (btn) return btn;
-        }
-        return document.querySelector('[data-testid="giveOutActionButton"]');
-    }
-
-    function handleBarcodeScan(barcode) {
-        const now = Date.now();
-        activeBarcode = barcode;
-        if (CIS_PATTERN.test(barcode)) console.log(`[Smart Control] Распознан КИЗ: ${barcode}.`);
-        const item = getTargetItem();
-        if (barcode === lastScannedBarcode && (now - lastScanTime) < 1500) {
-            if (item) {
-                item.style.outline = '3px solid #ff4d4f';
-                setTimeout(() => { if (item) item.style.outline = 'none'; }, 500);
-            }
-            const success = openDropdownAndSelect(item, 'DOUBLE_SCAN');
-            if (success) enterBlockUntil = Date.now() + 2000;
-            lastScannedBarcode = '';
-        } else {
-            lastScannedBarcode = barcode;
-            lastScanTime = now;
-        }
-    }
-
-    function triggerBtnToCheck() {
-        const targetItem = getTargetItem();
-        if (!targetItem) return;
-        const isAnnulated = targetItem.querySelector('[data-testid="btnToAnnulate"], [class*="_annulation_"]');
-        if (isAnnulated) return;
-        const btn = targetItem.querySelector('[data-testid="btnToCheck"]');
-        if (btn) simulateRealClick(btn);
-    }
-
-    function openDropdownAndSelect(targetItem, requestedNumOrDoubleScan) {
-        if (!targetItem) return false;
-        const isDoubleScan = requestedNumOrDoubleScan === 'DOUBLE_SCAN';
-        const requestedNum = typeof requestedNumOrDoubleScan === 'number' ? requestedNumOrDoubleScan : null;
-
-        const selectFromOpenMenu = () => {
-            let targetOption = null;
-            if (!isDoubleScan) {
-                const badge = document.querySelector(`.numpad-badge-helper[data-reason-num="${requestedNum}"]`);
-                if (badge) targetOption = badge.closest('[data-testid^="postingDropDownItemToAnnulate"]');
-                else {
-                    const options = Array.from(document.querySelectorAll('[data-testid^="postingDropDownItemToAnnulate"]'));
-                    if (options[requestedNum - 1]) targetOption = options[requestedNum - 1];
-                }
-            }
-            if (targetOption) simulateRealClick(targetOption.closest('button') || targetOption.closest('[role="menuitem"]') || targetOption);
-        };
-
-        if (document.querySelectorAll('[data-testid^="postingDropDownItemToAnnulate"]').length > 0) {
-            injectReasonNumbers();
-            selectFromOpenMenu();
-            return true;
-        }
-
-        let arrowBtn = null;
-        const splitBtns = targetItem.querySelectorAll('[class*="splitButton"] button');
-        if (splitBtns.length >= 2) arrowBtn = splitBtns[splitBtns.length - 1];
-        else {
-            const allBtns = Array.from(targetItem.querySelectorAll('button'));
-            arrowBtn = allBtns.find(b => b.querySelector('svg') && !b.textContent.trim() && !b.getAttribute('data-testid')?.match(/btnTo(Check|GiveOut|Annulate|Keep)/i));
-        }
-
-        if (!arrowBtn) return false;
-        simulateRealClick(arrowBtn);
-
-        let attempts = 0;
-        const checkDropdown = setInterval(() => {
-            attempts++;
-            if (document.querySelectorAll('[data-testid^="postingDropDownItemToAnnulate"]').length > 0) {
-                clearInterval(checkDropdown);
-                injectReasonNumbers();
-                selectFromOpenMenu();
-            } else if (attempts > 15) {
-                clearInterval(checkDropdown);
-            }
-        }, 100);
-
-        return true;
+        try { element.click(); } catch(e) {}
     }
 
 })();
