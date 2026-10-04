@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Ozon Smart Control (by desslow)
 // @namespace    http://tampermonkey.net/
-// @version      8.1
-// @description  Клавиатурный режим, интеграция с API сессий, таймер foundAt, цветная панель, мультивыбор
+// @version      8.2
+// @description  Клавиатурный режим, таймер foundAt, пульсирующая оплата, дропдаун, бинды RCtrl+1..7
 // @author       desslow & assistant
 // @match        https://*.ozon.ru/*
 // @run-at       document-start
@@ -12,18 +12,12 @@
 (function() {
     'use strict';
 
-    // ================= ПЕРЕХВАТЧИКИ API И ТОКЕНОВ =================
+    // ================= ПЕРЕХВАТЧИК ТОКЕНОВ =================
     window._ozonAuthHeaders = null;
-    let sessionsMap = new Map(); // sessionId -> foundAt
-    let currentPostingsData = null;
-
     const origFetch = window.fetch;
     window.fetch = async function(...args) {
         try {
             const config = args[1];
-            const url = typeof args[0] === 'string' ? args[0] : (args[0]?.url || '');
-
-            // Сохраняем токены
             if (config && config.headers) {
                 let headersObj = new Headers(config.headers);
                 if (headersObj.has('authorization')) {
@@ -35,51 +29,66 @@
                     };
                 }
             }
-
-            const response = await origFetch.apply(this, args);
-
-            // Перехватываем сессии для точного foundAt
-            if (url.includes('/api2/giveout/Sessions')) {
-                const clone = response.clone();
-                clone.json().then(data => {
-                    if (data && Array.isArray(data.sessions)) {
-                        data.sessions.forEach(s => {
-                            if (s.sessionId && s.foundAt) {
-                                sessionsMap.set(String(s.sessionId), new Date(s.foundAt).getTime());
-                            }
-                        });
-                    }
-                }).catch(() => {});
-            }
-
-            // Перехватываем товары для расчета суммы "К оплате"
-            if (url.includes('/api2/giveout/Postings')) {
-                const clone = response.clone();
-                clone.json().then(data => {
-                    if (data && Array.isArray(data.postings)) {
-                        currentPostingsData = data.postings;
-                        updatePaymentDisplay();
-                    }
-                }).catch(() => {});
-            }
-
-            return response;
-        } catch (e) {
-            return origFetch.apply(this, args);
-        }
+        } catch (e) {}
+        return origFetch.apply(this, args);
     };
 
-    // ================= СЛУЖЕБНЫЕ ПРОВЕРКИ =================
+    // ================= СОСТОЯНИЕ СЕССИИ И ОПЛАТЫ =================
+    let currentSessionId = null;
+    let currentFoundAtTimestamp = null;
+    let currentPaymentAmount = 0;
+    let isFetchingSessionData = false;
+
+    function getCurrentSessionIdFromUrl() {
+        const match = window.location.pathname.match(/\/orders\/session(?:-new)?\/(\d+)/);
+        return match ? match[1] : null;
+    }
+
     function isSessionPage() {
         const path = window.location.pathname;
         const hasSessionUrl = /\/orders\/session(-new)?\/\d+/.test(path);
-        const hasCardsInDom = !!document.querySelector('._card_1w2zp_1, [class*="_card_"]');
-        return hasSessionUrl || (path.includes('/orders') && hasCardsInDom);
+        const hasCards = !!document.querySelector('._card_1w2zp_1, [class*="_card_"]');
+        return hasSessionUrl || (path.includes('/orders') && hasCards);
     }
 
-    function getCurrentSessionId() {
-        const match = window.location.pathname.match(/\/orders\/session(?:-new)?\/(\d+)/);
-        return match ? match[1] : null;
+    // Активный запрос сессий и товаров через API Озона
+    async function syncSessionAndPostings(sessionId) {
+        if (!sessionId || !window._ozonAuthHeaders || isFetchingSessionData) return;
+        isFetchingSessionData = true;
+
+        try {
+            // 1. Запрашиваем Sessions для вычисления РЕАЛЬНОГО foundAt
+            const sessRes = await fetch('https://turbo-pvz.ozon.ru/api2/giveout/Sessions?filterByCurrentUser=false', {
+                headers: window._ozonAuthHeaders,
+                credentials: 'same-origin'
+            });
+
+            if (sessRes.ok) {
+                const data = await sessRes.json();
+                const sessionObj = data.sessions?.find(s => String(s.sessionId) === String(sessionId));
+                if (sessionObj && sessionObj.foundAt) {
+                    currentFoundAtTimestamp = new Date(sessionObj.foundAt).getTime();
+                    localStorage.setItem(`ozon_found_at_${sessionId}`, String(currentFoundAtTimestamp));
+                }
+            }
+        } catch (e) {}
+
+        try {
+            // 2. Запрашиваем Postings для подсчета суммы "К оплате"
+            const postRes = await fetch(`https://turbo-pvz.ozon.ru/api2/giveout/Postings?sessionId=${sessionId}&imageSize=800`, {
+                headers: window._ozonAuthHeaders,
+                credentials: 'same-origin'
+            });
+
+            if (postRes.ok) {
+                const data = await postRes.json();
+                const postings = data.postings || [];
+                currentPaymentAmount = postings.reduce((sum, p) => sum + (p.clientAmount || 0), 0);
+                updatePaymentUI();
+            }
+        } catch (e) {}
+
+        isFetchingSessionData = false;
     }
 
     // ================= КОНСТАНТЫ КЛАВИШ =================
@@ -103,7 +112,7 @@
 
     const CIS_PATTERN = /^[^a-zA-Z0-9]*01\d{13,14}21.+$/;
 
-    // Состояние скрипта
+    // Состояние интерфейса
     let activePackageIndex = 0;
     let activeBarcode = '';
     let lastScannedBarcode = '';
@@ -124,18 +133,13 @@
     let numpadReasonTimers = {};
 
     let audioCtx = null;
-    let isPanelCollapsed = false;
-
-    // Drag-to-select мышкой
     let isMouseDown = false;
     let isDraggingSelection = false;
-
-    console.log("[Smart Control] v8.1 активирован.");
 
     // ================= СТИЛИ (CSS) =================
     const style = document.createElement('style');
     style.innerHTML = `
-        /* Запрет системного выделения текста при работе с карточками */
+        /* Запрет выделения текста на карточках */
         ._card_1w2zp_1, [class*="_card_"], [class*="_item_"], #smart-control-panel {
             user-select: none !important;
             -webkit-user-select: none !important;
@@ -154,7 +158,7 @@
             transition: outline 0.15s, box-shadow 0.15s;
         }
 
-        /* Мультивыделение карточек */
+        /* Выделенные карточки */
         .smart-control-selected {
             outline: 3px solid #ff9800 !important;
             outline-offset: -2px !important;
@@ -181,7 +185,7 @@
             pointer-events: none;
         }
 
-        /* Прогресс зажатия Enter */
+        /* Прогресс Enter */
         .smart-btn-progress { position: relative !important; overflow: hidden !important; }
         .smart-btn-progress::after {
             content: ''; position: absolute; top: 0; left: 0; bottom: 0;
@@ -190,32 +194,29 @@
         }
         .smart-btn-progress.done::after { opacity: 0; }
 
-        /* Нижняя панель действий */
+        /* Нижняя панель управления */
         #smart-control-panel {
             position: fixed;
-            bottom: 16px;
+            bottom: 14px;
             left: 50%;
             transform: translateX(-50%);
-            background: rgba(18, 24, 38, 0.95);
-            backdrop-filter: blur(12px);
-            border: 1px solid rgba(255, 255, 255, 0.15);
+            background: rgba(18, 24, 38, 0.96);
+            backdrop-filter: blur(14px);
+            border: 1px solid rgba(255, 255, 255, 0.16);
             border-radius: 14px;
-            padding: 7px 12px;
+            padding: 6px 12px;
             display: flex;
             align-items: center;
             gap: 7px;
-            box-shadow: 0 10px 32px rgba(0, 0, 0, 0.6);
+            box-shadow: 0 10px 35px rgba(0, 0, 0, 0.65);
             z-index: 999999;
-            max-width: 95vw;
             box-sizing: border-box;
-            transition: all 0.2s ease-in-out;
         }
-        #smart-control-panel.collapsed .smart-panel-content { display: none !important; }
 
         .smart-panel-btn {
             color: #ffffff;
             border: none;
-            padding: 6px 11px;
+            padding: 6px 10px;
             border-radius: 8px;
             font-size: 12px;
             font-weight: 600;
@@ -224,19 +225,34 @@
             user-select: none;
             display: flex;
             align-items: center;
-            gap: 4px;
+            gap: 5px;
             white-space: nowrap;
         }
         .smart-panel-btn:hover { filter: brightness(1.15); transform: translateY(-1px); }
         .smart-panel-btn:active { transform: scale(0.96); }
 
-        /* Цвета кнопок */
-        .btn-giveout { background: #10b981 !important; } /* Зеленая */
+        /* Цвета */
         .btn-check   { background: #005bff !important; } /* Синяя */
+        .btn-giveout { background: #10b981 !important; } /* Зеленая */
         .btn-refuse  { background: #ef4444 !important; } /* Красная */
         .btn-keep    { background: #4b5563 !important; } /* Серая */
-        .btn-tool    { background: rgba(255, 255, 255, 0.12) !important; border: 1px solid rgba(255, 255, 255, 0.2) !important; }
+        .btn-more    { background: rgba(255, 255, 255, 0.1) !important; border: 1px solid rgba(255, 255, 255, 0.2) !important; }
 
+        /* Красивые клавишные бейджи (Keycaps) */
+        .smart-keycap {
+            background: rgba(0, 0, 0, 0.35);
+            border: 1px solid rgba(255, 255, 255, 0.25);
+            border-radius: 4px;
+            padding: 1px 4px;
+            font-size: 10px;
+            font-family: monospace;
+            font-weight: 700;
+            color: #ececec;
+            letter-spacing: -0.2px;
+            pointer-events: none;
+        }
+
+        /* Таймер foundAt */
         .smart-panel-timer {
             color: #ff9800;
             font-family: monospace;
@@ -244,9 +260,20 @@
             font-weight: bold;
             padding: 4px 7px;
             background: rgba(255, 152, 0, 0.15);
-            border: 1px solid rgba(255, 152, 0, 0.3);
+            border: 1px solid rgba(255, 152, 0, 0.35);
             border-radius: 6px;
             white-space: nowrap;
+        }
+
+        /* Неоновая пульсирующая оплата */
+        @keyframes pulse-neon {
+            0%   { box-shadow: 0 0 6px rgba(239, 68, 68, 0.5); border-color: rgba(239, 68, 68, 0.6); }
+            50%  { box-shadow: 0 0 18px rgba(239, 68, 68, 0.95); border-color: #ef4444; }
+            100% { box-shadow: 0 0 6px rgba(239, 68, 68, 0.5); border-color: rgba(239, 68, 68, 0.6); }
+        }
+        @keyframes blink-dot {
+            0%, 100% { opacity: 1; transform: scale(1); }
+            50%      { opacity: 0.3; transform: scale(0.8); }
         }
         .smart-panel-pay {
             font-size: 12px;
@@ -254,52 +281,108 @@
             padding: 4px 8px;
             border-radius: 6px;
             white-space: nowrap;
+            display: flex;
+            align-items: center;
+            gap: 5px;
         }
-        .pay-needed { background: rgba(239, 68, 68, 0.2); color: #f87171; border: 1px solid rgba(239, 68, 68, 0.4); }
-        .pay-clean  { background: rgba(16, 185, 129, 0.2); color: #34d399; border: 1px solid rgba(16, 185, 129, 0.4); }
+        .pay-needed {
+            background: linear-gradient(135deg, rgba(239, 68, 68, 0.25), rgba(185, 28, 28, 0.45)) !important;
+            color: #fff !important;
+            border: 1px solid #ef4444 !important;
+            animation: pulse-neon 1.6s infinite ease-in-out;
+        }
+        .pay-needed .pay-dot {
+            display: inline-block;
+            width: 7px;
+            height: 7px;
+            background-color: #ef4444;
+            border-radius: 50%;
+            animation: blink-dot 0.8s infinite ease-in-out;
+        }
+        .pay-clean {
+            background: rgba(16, 185, 129, 0.18);
+            color: #34d399;
+            border: 1px solid rgba(16, 185, 129, 0.35);
+        }
+
+        /* Выпадающее меню "Еще ▾" */
+        #smart-more-dropdown {
+            position: absolute;
+            bottom: calc(100% + 8px);
+            right: 0;
+            background: rgba(22, 29, 45, 0.98);
+            backdrop-filter: blur(14px);
+            border: 1px solid rgba(255, 255, 255, 0.18);
+            border-radius: 10px;
+            padding: 6px;
+            display: none;
+            flex-direction: column;
+            gap: 4px;
+            box-shadow: 0 8px 24px rgba(0,0,0,0.6);
+            z-index: 1000000;
+        }
+        #smart-more-dropdown.show { display: flex !important; }
+        .smart-dropdown-item {
+            background: rgba(255, 255, 255, 0.08);
+            color: #ffffff;
+            border: none;
+            padding: 7px 12px;
+            border-radius: 6px;
+            font-size: 12px;
+            font-weight: 600;
+            cursor: pointer;
+            text-align: left;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 12px;
+            white-space: nowrap;
+            transition: all 0.15s;
+        }
+        .smart-dropdown-item:hover { background: rgba(255, 255, 255, 0.18); }
     `;
     document.head.appendChild(style);
 
     // ================= ТАЙМЕР СЕССИИ (foundAt) =================
-    function updateSessionTimer() {
+    function updateSessionTimerUI() {
         const timerEl = document.getElementById('smart-session-timer');
         if (!timerEl) return;
 
-        const sessionId = getCurrentSessionId();
-        let startTime = sessionId ? sessionsMap.get(String(sessionId)) : null;
-
-        // Если foundAt еще не подгрузился из API, используем время старта страницы
-        if (!startTime) {
-            if (!window._localSessionStart) window._localSessionStart = Date.now();
-            startTime = window._localSessionStart;
+        const sessionId = getCurrentSessionIdFromUrl();
+        if (sessionId && sessionId !== currentSessionId) {
+            currentSessionId = sessionId;
+            // Пробуем взять сохраненный foundAt из кэша
+            const cached = localStorage.getItem(`ozon_found_at_${sessionId}`);
+            currentFoundAtTimestamp = cached ? parseInt(cached, 10) : null;
+            // Фоново дергаем API
+            syncSessionAndPostings(sessionId);
         }
 
-        const elapsed = Math.max(0, Math.floor((Date.now() - startTime) / 1000));
+        if (!currentFoundAtTimestamp) {
+            timerEl.textContent = `⏱ --:--`;
+            return;
+        }
+
+        const elapsed = Math.max(0, Math.floor((Date.now() - currentFoundAtTimestamp) / 1000));
         const mins = String(Math.floor(elapsed / 60)).padStart(2, '0');
         const secs = String(elapsed % 60).padStart(2, '0');
         timerEl.textContent = `⏱ ${mins}:${secs}`;
     }
 
-    // ================= БЕЙДЖ "К ОПЛАТЕ" =================
-    function updatePaymentDisplay() {
+    function updatePaymentUI() {
         const payEl = document.getElementById('smart-session-pay');
         if (!payEl) return;
 
-        let totalToPay = 0;
-        if (currentPostingsData && Array.isArray(currentPostingsData)) {
-            totalToPay = currentPostingsData.reduce((acc, p) => acc + (p.clientAmount || 0), 0);
-        }
-
-        if (totalToPay > 0) {
+        if (currentPaymentAmount > 0) {
             payEl.className = 'smart-panel-pay pay-needed';
-            payEl.textContent = `К оплате: ${totalToPay} ₽`;
+            payEl.innerHTML = `<span class="pay-dot"></span>К оплате: ${currentPaymentAmount} ₽`;
         } else {
             payEl.className = 'smart-panel-pay pay-clean';
-            payEl.textContent = `Оплачено`;
+            payEl.innerHTML = `✓ Оплачено`;
         }
     }
 
-    // ================= ПАНЕЛЬ УПРАВЛЕНИЯ =================
+    // ================= ОТРИСОВКА ПАНЕЛИ =================
     function injectControlPanel() {
         if (!isSessionPage()) {
             const existing = document.getElementById('smart-control-panel');
@@ -312,41 +395,70 @@
         const panel = document.createElement('div');
         panel.id = 'smart-control-panel';
         panel.innerHTML = `
-            <div id="smart-session-timer" class="smart-panel-timer">⏱ 00:00</div>
-            <div id="smart-session-pay" class="smart-panel-pay pay-clean">Оплачено</div>
+            <div id="smart-session-timer" class="smart-panel-timer">⏱ --:--</div>
+            <div id="smart-session-pay" class="smart-panel-pay pay-clean">✓ Оплачено</div>
             
-            <div class="smart-panel-content" style="display: flex; align-items: center; gap: 6px;">
-                <button class="smart-panel-btn btn-check" id="smart-btn-check-all">Все на проверку</button>
-                <button class="smart-panel-btn btn-giveout" id="smart-btn-giveout-all">Все к выдаче</button>
-                <button class="smart-panel-btn btn-refuse" id="smart-btn-refuse-all">Все в отказ</button>
-                <button class="smart-panel-btn btn-keep" id="smart-btn-keep-all">Все на хранение</button>
-                <button class="smart-panel-btn btn-tool" id="smart-btn-select-similar">Выделить однотипное</button>
-                <button class="smart-panel-btn btn-tool" id="smart-btn-select-all" style="border-color: #ff9800;">Выделить все</button>
-                <button class="smart-panel-btn btn-tool" id="smart-btn-deselect-all">Снять все</button>
-            </div>
+            <button class="smart-panel-btn btn-check" id="smart-btn-check-all">
+                Все на проверку <span class="smart-keycap">RCtrl+1</span>
+            </button>
+            <button class="smart-panel-btn btn-giveout" id="smart-btn-giveout-all">
+                Все к выдаче <span class="smart-keycap">RCtrl+2</span>
+            </button>
+            <button class="smart-panel-btn btn-refuse" id="smart-btn-refuse-all">
+                Все в отказ <span class="smart-keycap">RCtrl+3</span>
+            </button>
+            <button class="smart-panel-btn btn-keep" id="smart-btn-keep-all">
+                Все на хранение <span class="smart-keycap">RCtrl+4</span>
+            </button>
 
-            <button id="smart-panel-collapse-btn" style="background: none; border: none; color: #888; cursor: pointer; font-size: 14px; padding: 0 4px;" title="Свернуть/Развернуть">▢</button>
+            <div style="position: relative;">
+                <button class="smart-panel-btn btn-more" id="smart-btn-more">
+                    Еще ▾
+                </button>
+                <div id="smart-more-dropdown">
+                    <button class="smart-dropdown-item" id="smart-btn-select-similar">
+                        Выделить однотипное <span class="smart-keycap">RCtrl+5</span>
+                    </button>
+                    <button class="smart-dropdown-item" id="smart-btn-select-all">
+                        Выделить все <span class="smart-keycap">RCtrl+6</span>
+                    </button>
+                    <button class="smart-dropdown-item" id="smart-btn-deselect-all">
+                        Снять все <span class="smart-keycap">RCtrl+7</span>
+                    </button>
+                </div>
+            </div>
         `;
         document.body.appendChild(panel);
 
-        // Обработчики кнопок панели
-        document.getElementById('smart-btn-select-all').onclick = () => selectAllCards(true);
-        document.getElementById('smart-btn-deselect-all').onclick = () => selectAllCards(false);
-        document.getElementById('smart-btn-select-similar').onclick = selectSimilarCards;
+        // Обработчики кнопок
         document.getElementById('smart-btn-check-all').onclick = () => massExecute('check');
         document.getElementById('smart-btn-giveout-all').onclick = () => massExecute('giveout');
         document.getElementById('smart-btn-refuse-all').onclick = () => massExecute('refuse');
         document.getElementById('smart-btn-keep-all').onclick = () => massExecute('keep');
 
-        document.getElementById('smart-panel-collapse-btn').onclick = () => {
-            isPanelCollapsed = !isPanelCollapsed;
-            panel.classList.toggle('collapsed', isPanelCollapsed);
+        // Логика дропдауна "Еще ▾"
+        const moreBtn = document.getElementById('smart-btn-more');
+        const dropdown = document.getElementById('smart-more-dropdown');
+
+        moreBtn.onclick = (e) => {
+            e.stopPropagation();
+            dropdown.classList.toggle('show');
         };
 
-        updatePaymentDisplay();
+        document.addEventListener('click', (e) => {
+            if (!e.target.closest('#smart-more-dropdown') && !e.target.closest('#smart-btn-more')) {
+                dropdown.classList.remove('show');
+            }
+        });
+
+        document.getElementById('smart-btn-select-similar').onclick = () => { selectSimilarCards(); dropdown.classList.remove('show'); };
+        document.getElementById('smart-btn-select-all').onclick = () => { selectAllCards(true); dropdown.classList.remove('show'); };
+        document.getElementById('smart-btn-deselect-all').onclick = () => { selectAllCards(false); dropdown.classList.remove('show'); };
+
+        updatePaymentUI();
     }
 
-    // ================= МУЛЬТИВЫДЕЛЕНИЕ И ЛОГИКА =================
+    // ================= МУЛЬТИВЫБОР И ДЕЙСТВИЯ =================
     function getAllCards() {
         return Array.from(document.querySelectorAll('._card_1w2zp_1, [class*="_card_"]'));
     }
@@ -362,11 +474,9 @@
         });
     }
 
-    // Выделить однотипные товары
     function selectSimilarCards() {
         const target = getTargetItem();
         if (!target) return;
-
         const targetTitleEl = target.querySelector('[data-testid="postingName"], [class*="_name_"]');
         const targetTitle = targetTitleEl ? targetTitleEl.textContent.trim().toLowerCase() : '';
         if (!targetTitle) return;
@@ -383,7 +493,7 @@
     window.addEventListener('mousedown', function(e) {
         if (!isSessionPage()) return;
         if (e.button !== 0) return;
-        if (e.target.closest('button, input, textarea, a, svg, #smart-control-panel')) return;
+        if (e.target.closest('button, input, textarea, a, svg, #smart-control-panel, #smart-more-dropdown')) return;
 
         isMouseDown = true;
         isDraggingSelection = false;
@@ -404,7 +514,7 @@
         if (!isSessionPage()) return;
 
         if (isMouseDown && !isDraggingSelection && e.button === 0) {
-            if (!e.target.closest('button, input, textarea, a, svg, #smart-control-panel')) {
+            if (!e.target.closest('button, input, textarea, a, svg, #smart-control-panel, #smart-more-dropdown')) {
                 const card = e.target.closest('._card_1w2zp_1, [class*="_card_"]');
                 if (card) card.classList.toggle('smart-control-selected');
             }
@@ -413,7 +523,6 @@
         setTimeout(() => { isDraggingSelection = false; }, 50);
     }, true);
 
-    // ================= МАССОВЫЕ ДЕЙСТВИЯ =================
     async function massExecute(actionType) {
         let targets = getSelectedCards();
         if (targets.length === 0) targets = getAllCards();
@@ -421,7 +530,7 @@
         for (let card of targets) {
             if (actionType === 'check') {
                 const isAnnulated = card.querySelector('[data-testid="btnToAnnulate"], [class*="_annulation_"]');
-                if (isAnnulated) continue; // Защита от сброса
+                if (isAnnulated) continue;
                 const btn = card.querySelector('[data-testid="btnToCheck"]');
                 if (btn) simulateRealClick(btn);
             } 
@@ -430,14 +539,9 @@
                 if (btn) simulateRealClick(btn);
             } 
             else if (actionType === 'refuse') {
-                // Если кнопка отмены уже готова - жмем её
                 const directAnnulate = card.querySelector('[data-testid="btnToAnnulate"]');
-                if (directAnnulate) {
-                    simulateRealClick(directAnnulate);
-                } else {
-                    // Иначе раскрываем и жмем причину 4 ("Отказ клиента")
-                    openDropdownAndSelect(card, 4);
-                }
+                if (directAnnulate) simulateRealClick(directAnnulate);
+                else openDropdownAndSelect(card, 4);
             } 
             else if (actionType === 'keep') {
                 const btn = card.querySelector('[data-testid="btnToKeep"]');
@@ -446,6 +550,33 @@
             await new Promise(r => setTimeout(r, 70));
         }
     }
+
+    // ================= БИНДЫ НА ПРАВЫЙ CTRL + 1..7 =================
+    let isRightCtrlHeld = false;
+
+    window.addEventListener('keydown', function(e) {
+        if (!isSessionPage()) return;
+
+        if (e.code === 'ControlRight' || (e.ctrlKey && e.location === 2)) {
+            isRightCtrlHeld = true;
+        }
+
+        if (isRightCtrlHeld || (e.ctrlKey && e.location === 2)) {
+            if (e.code === 'Digit1' || e.code === 'Numpad1') { e.preventDefault(); e.stopPropagation(); massExecute('check'); }
+            else if (e.code === 'Digit2' || e.code === 'Numpad2') { e.preventDefault(); e.stopPropagation(); massExecute('giveout'); }
+            else if (e.code === 'Digit3' || e.code === 'Numpad3') { e.preventDefault(); e.stopPropagation(); massExecute('refuse'); }
+            else if (e.code === 'Digit4' || e.code === 'Numpad4') { e.preventDefault(); e.stopPropagation(); massExecute('keep'); }
+            else if (e.code === 'Digit5' || e.code === 'Numpad5') { e.preventDefault(); e.stopPropagation(); selectSimilarCards(); }
+            else if (e.code === 'Digit6' || e.code === 'Numpad6') { e.preventDefault(); e.stopPropagation(); selectAllCards(true); }
+            else if (e.code === 'Digit7' || e.code === 'Numpad7') { e.preventDefault(); e.stopPropagation(); selectAllCards(false); }
+        }
+    }, true);
+
+    window.addEventListener('keyup', function(e) {
+        if (e.code === 'ControlRight' || e.location === 2) {
+            isRightCtrlHeld = false;
+        }
+    }, true);
 
     // ================= НАВИГАЦИЯ СТРЕЛКАМИ =================
     function navigateCards(direction) {
@@ -471,7 +602,7 @@
         newTarget.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
     }
 
-    // ================= ГЛАВНЫЙ ТИК =================
+    // ================= ГЛАВНЫЙ ИНТЕРВАЛ =================
     setInterval(() => {
         if (!isSessionPage()) {
             const p = document.getElementById('smart-control-panel');
@@ -482,10 +613,10 @@
         injectReasonNumbers();
         maintainFocusVisual();
         injectControlPanel();
-        updateSessionTimer();
+        updateSessionTimerUI();
     }, 200);
 
-    // ================= ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ =================
+    // ================= СЛУЖЕБНЫЙ ФУНКЦИОНАЛ ВЫДАЧИ =================
     function injectReasonNumbers() {
         const dropdownItems = document.querySelectorAll('[data-testid^="postingDropDownItemToAnnulate"]');
         if (dropdownItems.length === 0) return;
@@ -501,7 +632,6 @@
 
             let text = labelContainer.textContent.toLowerCase();
             let num = null;
-
             if (text.includes('брак') || text.includes('поврежд') || text.includes('разбит') || text.includes('дефект')) num = 1;
             else if (text.includes('ошиб') || text.includes('не тот') || text.includes('подмен') || text.includes('пересорт')) num = 2;
             else if (text.includes('неполн') || text.includes('пуст') || text.includes('част') || text.includes('вскрыт')) num = 3;
@@ -638,11 +768,11 @@
         });
     }
 
-    // ================= ШОРТКАТЫ И СТРЕЛКИ =================
+    // ================= ШОРТКАТЫ И СКАНЕР =================
     window.addEventListener('keydown', function(e) {
         if (!isSessionPage()) return;
 
-        if (!isInputActive()) {
+        if (!isInputActive() && !isRightCtrlHeld) {
             if (e.code === 'ArrowDown' || e.code === 'ArrowRight') {
                 e.preventDefault(); navigateCards('down'); return;
             }
