@@ -625,6 +625,18 @@
         setTimeout(() => { if (toast) toast.remove(); }, 8000);
     }
 
+    function getCardAnnulateReasonNum(card) {
+        const btn = Array.from(card.querySelectorAll('button')).find(b => b.textContent.includes('К аннуляции'));
+        if (!btn) return 4;
+        const text = btn.textContent.toLowerCase();
+        if (text.includes('брак') || text.includes('дефект') || text.includes('поврежд')) return 1;
+        if (text.includes('не тот') || text.includes('ошиб') || text.includes('пересорт')) return 2;
+        if (text.includes('неполн') || text.includes('пуст') || text.includes('вскрыт')) return 3;
+        if (text.includes('решени') || text.includes('отказ') || text.includes('передумал')) return 4;
+        if (text.includes('срок') || text.includes('просроч')) return 5;
+        return 4;
+    }
+
     document.addEventListener('click', function(e) {
         const btn = e.target.closest('[data-testid="btnToCheck"]');
         if (!btn) return;
@@ -632,22 +644,23 @@
         const card = btn.closest('[class*="_card_"]');
 
         if (card && isCardReallyAnnulated(card)) {
-            e.preventDefault();
-            e.stopPropagation();
-            e.stopImmediatePropagation();
-            playAnnulateAlert();
-            return;
+            const reasonNum = getCardAnnulateReasonNum(card);
+            setTimeout(() => {
+                if (!isCardReallyAnnulated(card)) {
+                    openDropdownAndSelect(card, reasonNum);
+                    console.log(`[Smart Control] 🛡️ Аннуляция (причина ${reasonNum}) сохранена после проверки!`);
+                }
+            }, 300);
         }
 
-        // Проверка на экземпляры (• X)
         const match = btn.textContent.match(/•\s*(\d+)/);
-        if (!match) return; // Обычный товар
+        if (!match) return;
 
         if (btn.dataset.exemplarState === 'unlocked') {
             return;
         }
 
-        // Блокируем первый клик
+        // Блокируем первый клик на экземплярах
         e.preventDefault();
         e.stopPropagation();
         e.stopImmediatePropagation();
@@ -676,6 +689,7 @@
             }
         }, 1000);
     }, true);
+
 
 
     function updateSessionTimerUI() {
@@ -1339,11 +1353,6 @@
     function triggerBtnToCheck() {
         const targetItem = getTargetItem();
         if (!targetItem) return;
-
-        if (isCardReallyAnnulated(targetItem)) {
-            playAnnulateAlert();
-            return;
-        }
 
         const btn = targetItem.querySelector('[data-testid="btnToCheck"]');
         if (btn) simulateRealClick(btn);
