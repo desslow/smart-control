@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Ozon Smart Control
 // @namespace    http://tampermonkey.net/
-// @version      8.7
+// @version      8.7.2
 // @description  Клавиатурный режим выдачи заказов.
 // @author       desslow
 // @match        https://*.ozon.ru/*
@@ -422,6 +422,20 @@
             color: #fff !important;
         }
 
+        body.smart-focus-active [class*="_card_"].smart-control-selected {
+            order: -1 !important;
+            transition: all 0.3s ease !important;
+        }
+
+        /* Невыделенные карточки уходят вниз и размываются блюром */
+        body.smart-focus-active [class*="_card_"]:not(.smart-control-selected) {
+            order: 1 !important;
+            filter: blur(6px) opacity(0.3) !important;
+            pointer-events: none !important;
+            transition: all 0.3s ease !important;
+        }
+
+
         #smart-more-dropdown {
             position: absolute;
             bottom: calc(100% + 8px);
@@ -489,10 +503,22 @@
         /* Полоса отката внутри кнопки "Проверить" */
         .smart-btn-countdown-locked {
             position: relative !important;
-            overflow: hidden !important;
             pointer-events: none !important;
-            filter: grayscale(0.2) !important;
             cursor: not-allowed !important;
+        }
+        .smart-btn-countdown-locked::after {
+            content: attr(data-smart-cd-text);
+            position: absolute !important;
+            top: 0; left: 0; right: 0; bottom: 0;
+            background: #ef4444 !important;
+            color: #ffffff !important;
+            font-size: 13px !important;
+            font-weight: bold !important;
+            display: flex !important;
+            align-items: center !important;
+            justify-content: center !important;
+            z-index: 9999 !important;
+            border-radius: inherit !important;
         }
         .smart-btn-countdown-bar {
             position: absolute;
@@ -527,7 +553,7 @@
             }
         });
     }
-    
+
     const audioWarningExemplar = new Audio('https://st.ozone.ru/s3/turbo-pvz-ui-bucket/mp3/warning.mp3');
     audioWarningExemplar.preload = 'auto';
 
@@ -538,7 +564,10 @@
         } catch (e) {}
     }
 
-    // ================= ПЛАШКА НАД ПАНЕЛЬЮ =================
+    const audioSuccessAll = new Audio('https://st.ozone.ru/s3/turbo-pvz-ui-bucket/mp3/success.mp3');
+    audioSuccessAll.preload = 'auto';
+    let allGiveoutSoundPlayed = false;
+
     function updateExemplarBannerUI() {
         let hasExemplars = false;
         document.querySelectorAll('[data-testid="btnToCheck"]').forEach(btn => {
@@ -561,7 +590,6 @@
         }
     }
 
-    // ================= БОКОВОЕ УВЕДОМЛЕНИЕ О СВЕРКЕ =================
     function showExemplarSideToast(count) {
         let toast = document.getElementById('smart-exemplar-side-toast');
         if (toast) toast.remove();
@@ -597,20 +625,29 @@
         setTimeout(() => { if (toast) toast.remove(); }, 8000);
     }
 
-    // ================= ПЕРЕХВАТ ПЕРВОГО КЛИКА И ОТКАТ НА 10 СЕК =================
     document.addEventListener('click', function(e) {
         const btn = e.target.closest('[data-testid="btnToCheck"]');
         if (!btn) return;
 
-        const match = btn.textContent.match(/•\s*(\d+)/);
-        if (!match) return; // Обычный товар без экземпляров — пропускаем
+        const card = btn.closest('[class*="_card_"]');
 
-        // Если кнопка уже прошла 10-секундный откат — разрешаем клик!
+        if (card && isCardReallyAnnulated(card)) {
+            e.preventDefault();
+            e.stopPropagation();
+            e.stopImmediatePropagation();
+            playAnnulateAlert();
+            return;
+        }
+
+        // Проверка на экземпляры (• X)
+        const match = btn.textContent.match(/•\s*(\d+)/);
+        if (!match) return; // Обычный товар
+
         if (btn.dataset.exemplarState === 'unlocked') {
             return;
         }
 
-        // БЛОКИРУЕМ ПЕРВЫЙ КЛИК!
+        // Блокируем первый клик
         e.preventDefault();
         e.stopPropagation();
         e.stopImmediatePropagation();
@@ -620,36 +657,26 @@
         const count = match[1];
         btn.dataset.exemplarState = 'cooling';
 
-        // 1. Звук warning
         playExemplarWarningSound();
-
-        // 2. Уведомление справа
         showExemplarSideToast(count);
 
-        // 3. Запуск отката на 10 секунд прямо в кнопке
         let timeLeft = 10;
         btn.classList.add('smart-btn-countdown-locked');
-        const originalHtml = btn.innerHTML;
-
-        const bar = document.createElement('div');
-        bar.className = 'smart-btn-countdown-bar';
-        btn.appendChild(bar);
+        btn.setAttribute('data-smart-cd-text', `Сверьте: ${timeLeft} сек`);
 
         const cdTimer = setInterval(() => {
             timeLeft--;
-            bar.style.width = `${(timeLeft / 10) * 100}%`;
-
-            const labelEl = btn.querySelector('[class*="_text_"]') || btn;
-            labelEl.textContent = `Сверьте товар: ${timeLeft} сек`;
+            btn.setAttribute('data-smart-cd-text', `Сверьте: ${timeLeft} сек`);
 
             if (timeLeft <= 0) {
                 clearInterval(cdTimer);
                 btn.classList.remove('smart-btn-countdown-locked');
-                btn.innerHTML = originalHtml;
-                btn.dataset.exemplarState = 'unlocked'; // РАЗБЛОКИРОВАНО ДЛЯ ПОВТОРНОГО НАЖАТИЯ!
+                btn.removeAttribute('data-smart-cd-text');
+                btn.dataset.exemplarState = 'unlocked';
             }
         }, 1000);
-    }, true); // Фаза перехвата (capture: true) перехватывает клик до Озона!
+    }, true);
+
 
     function updateSessionTimerUI() {
         const timerEl = document.getElementById('smart-session-timer');
@@ -658,8 +685,10 @@
         const sessionId = getCurrentSessionIdFromUrl();
         if (sessionId && sessionId !== currentSessionId) {
             currentSessionId = sessionId;
-            totalUnpaidDebt = 0;
-            currentPostingsData = null;
+            isFocusMode = false;
+            document.body.classList.remove('smart-focus-active');
+            const badge = document.getElementById('smart-focus-mode-badge');
+            if (badge) badge.style.display = 'none';
 
             let foundAtTime = sessionsMap.get(String(sessionId));
             if (!foundAtTime) {
@@ -679,74 +708,67 @@
         }
 
         const elapsed = Math.max(0, Math.floor((Date.now() - currentFoundAtTimestamp) / 1000));
-        const mins = String(Math.floor(elapsed / 60)).padStart(2, '0');
+        const hours = Math.floor(elapsed / 3600);
+        const mins = String(Math.floor((elapsed % 3600) / 60)).padStart(2, '0');
         const secs = String(elapsed % 60).padStart(2, '0');
-        timerEl.textContent = `⏱ ${mins}:${secs}`;
+
+        // часы, если время перевалило за 60 минут
+        if (hours > 0) {
+            timerEl.textContent = `⏱ ${hours}:${mins}:${secs}`;
+        } else {
+            timerEl.textContent = `⏱ ${mins}:${secs}`;
+        }
+    }
+
+    function getCardPrice(card) {
+        const allEls = Array.from(card.querySelectorAll('*'));
+        for (let el of allEls) {
+            if (el.children.length === 0 && el.textContent.includes('₽')) {
+                const clean = el.textContent.replace(/\s+/g, '').replace(/[^\d,.]/g, '').replace(',', '.');
+                const val = parseFloat(clean);
+                if (!isNaN(val) && val > 0) return val;
+            }
+        }
+        return 0;
     }
 
     function updateStatusSlotUI() {
         const slotEl = document.getElementById('smart-status-slot');
         if (!slotEl) return;
 
-        const sessInfo = sessionsMap.get(String(currentSessionId));
-        const isPrepaidOrder = (sessInfo && sessInfo.allPrepaid) || (totalUnpaidDebt === 0);
+        const cards = getAllCards();
+        let totalDebt = 0;
+        let readyToPay = 0;
 
-        // 1. ЕСЛИ ЗАКАЗ ПОЛНОСТЬЮ ОПЛАЧЕН
-        if (isPrepaidOrder && totalUnpaidDebt === 0) {
-            slotEl.className = 'smart-panel-pay pay-clean';
+        cards.forEach(card => {
+            const isUnpaid = card.textContent.includes('Требуется оплата');
+            if (!isUnpaid) return;
+
+            const price = getCardPrice(card);
+            totalDebt += price;
+
+            const isGiveOut = card.textContent.includes('К выдаче') && !card.textContent.includes('К аннуляции');
+            if (isGiveOut) {
+                readyToPay += price;
+            }
+        });
+
+        if (totalDebt === 0) {
+            slotEl.className = 'pay-clean';
             slotEl.innerHTML = `✓ Оплачено`;
             slotEl.title = "Все товары в заказе оплачены";
             return;
         }
 
-        // 2. СЧИТАЕМ СУММУ ТОВАРОВ, КОТОРЫЕ УЖЕ ГОТОВЫ К ВЫДАЧЕ
-        let scannedUnpaidSum = 0;
-        let hasScannedUnpaid = false;
-
-        const cards = getAllCards();
-        cards.forEach(card => {
-            const isReady = card.querySelector('[data-testid="btnToGiveOut"]') ||
-                            card.querySelector('[class*="_giveOut_"]') ||
-                            card.querySelector('[class*="_success_"]') ||
-                            (card.className && card.className.includes('_success_'));
-
-            if (isReady && currentPostingsData) {
-                const testId = card.getAttribute('data-testid') || '';
-                const p = currentPostingsData.find(item =>
-                    String(item.id) === testId ||
-                    (item.barcodes && item.barcodes.includes(testId))
-                );
-                if (p && p.clientAmount > 0) {
-                    scannedUnpaidSum += p.clientAmount;
-                    hasScannedUnpaid = true;
-                }
-            }
-        });
-
-        // Запасная сверка с виджетом самого Озона в правом углу
-        if (!hasScannedUnpaid) {
-            const nativeWidget = document.querySelector('[class*="_widgetList_"]');
-            if (nativeWidget) {
-                const match = nativeWidget.textContent.replace(/\s+/g, '').match(/(\d+(?:[.,]\d+)?)/);
-                if (match) {
-                    const parsed = parseFloat(match[1].replace(',', '.'));
-                    if (parsed > 0) {
-                        scannedUnpaidSum = parsed;
-                        hasScannedUnpaid = true;
-                    }
-                }
-            }
-        }
-
         slotEl.className = 'pay-needed';
 
-        if (hasScannedUnpaid && scannedUnpaidSum > 0) {
-            slotEl.innerHTML = `<span class="pay-dot"></span>Сумма: ${scannedUnpaidSum}/${totalUnpaidDebt} ₽`;
-            slotEl.title = `К списанию сейчас: ${scannedUnpaidSum} ₽ (Общий долг: ${totalUnpaidDebt} ₽)`;
+        if (readyToPay > 0) {
+            slotEl.innerHTML = `<span class="pay-dot"></span>Сумма: ${readyToPay}/${totalDebt} ₽`;
+            slotEl.title = `К списанию сейчас: ${readyToPay} ₽ (Всего к оплате: ${totalDebt} ₽)`;
         }
         else {
-            slotEl.innerHTML = `<span class="pay-dot"></span>Сумма: ${totalUnpaidDebt} ₽`;
-            slotEl.title = "Общий долг по заказу (товары еще не проверены)";
+            slotEl.innerHTML = `<span class="pay-dot"></span>Сумма: ${totalDebt} ₽`;
+            slotEl.title = `Общий долг по заказу: ${totalDebt} ₽`;
         }
     }
 
@@ -879,6 +901,24 @@
         });
     }
 
+    function checkAllGivenOutTrigger() {
+        const cards = getAllCards();
+        if (cards.length === 0) return;
+
+        // Все карточки должны иметь статус "К выдаче"
+        const allReady = cards.every(c => c.textContent.includes('К выдаче') && !c.textContent.includes('К аннуляции'));
+
+        if (allReady && !allGiveoutSoundPlayed) {
+            allGiveoutSoundPlayed = true;
+            try {
+                audioDuolingo.currentTime = 0;
+                audioDuolingo.play().catch(() => {});
+            } catch(e) {}
+        } else if (!allReady) {
+            allGiveoutSoundPlayed = false;
+        }
+    }
+
     function toggleFocusMode() {
         isFocusMode = !isFocusMode;
         document.body.classList.toggle('smart-focus-active', isFocusMode);
@@ -965,7 +1005,6 @@
         // РАБОТАЕТ ВЕЗДЕ НА СТРАНИЦЕ ЗАКАЗОВ (как в v7.9)
         if (!isOrdersPage()) return;
 
-        // ДВОЙНОЙ RCTRL (ФОКУС-МОД)
         if (e.code === 'ControlRight' || (e.ctrlKey && e.location === 2)) {
             isRightCtrlHeld = true;
             rCtrlPresses++;
@@ -978,7 +1017,6 @@
             }
         }
 
-        // ВЫДЕЛЕНИЕ НА ПРОБЕЛ
         if (e.code === 'Space') {
             if (isInputActive()) return;
             e.preventDefault();
@@ -988,7 +1026,6 @@
             return;
         }
 
-        // БИНДЫ RCTRL + 1..7
         if (isRightCtrlHeld || (e.ctrlKey && e.location === 2)) {
             if (e.code === 'Digit1' || e.code === 'Numpad1') { e.preventDefault(); e.stopPropagation(); massExecute('check'); }
             else if (e.code === 'Digit2' || e.code === 'Numpad2') { e.preventDefault(); e.stopPropagation(); massExecute('giveout'); }
@@ -999,7 +1036,6 @@
             else if (e.code === 'Digit7' || e.code === 'Numpad7') { e.preventDefault(); e.stopPropagation(); selectAllCards(false); }
         }
 
-        // СТРЕЛКИ
         if (!isInputActive() && !isRightCtrlHeld && e.code !== 'Space') {
             if (e.code === 'ArrowDown' || e.code === 'ArrowRight') {
                 e.preventDefault(); navigateCards('down'); return;
@@ -1114,7 +1150,7 @@
                     heldButton.classList.add('done');
                     simulateRealClick(heldButton);
                     isEnterHolding = false;
-                    enterCompleted = true; // Блокируем новые нажатия, пока Enter не отпустят руками
+                    enterCompleted = true;
                     heldButton = null;
                 }, 400);
             } else {
@@ -1129,7 +1165,7 @@
         if (e.code === 'ControlRight' || e.location === 2) isRightCtrlHeld = false;
 
         if (e.code === KEY_ENTER) {
-            enterCompleted = false; // Сбрасываем флаг, когда физически отпустили клавишу
+            enterCompleted = false;
             if (isEnterHolding) {
                 clearTimeout(enterHoldTimeout);
                 if (heldButton) heldButton.style.setProperty('--smart-progress', '0%');
@@ -1176,23 +1212,59 @@
         const cards = getAllCards();
         if (cards.length === 0) return;
 
-        let currentIndex = cards.indexOf(getTargetItem());
-        if (currentIndex === -1) currentIndex = 0;
+        const current = getTargetItem() || cards[0];
+        const curRect = current.getBoundingClientRect();
+        const curCenterX = curRect.left + curRect.width / 2;
+        const curCenterY = curRect.top + curRect.height / 2;
 
-        if (direction === 'down' || direction === 'right') {
-            currentIndex = (currentIndex + 1) % cards.length;
-        } else if (direction === 'up' || direction === 'left') {
-            currentIndex = (currentIndex - 1 + cards.length) % cards.length;
+        let bestCandidate = null;
+        let bestDistance = Infinity;
+
+        cards.forEach(card => {
+            if (card === current) return;
+            const r = card.getBoundingClientRect();
+            const cx = r.left + r.width / 2;
+            const cy = r.top + r.height / 2;
+
+            const dx = cx - curCenterX;
+            const dy = cy - curCenterY;
+
+            let isValid = false;
+
+            if (direction === 'right' && dx > 30 && Math.abs(dy) < r.height) isValid = true;
+            else if (direction === 'left' && dx < -30 && Math.abs(dy) < r.height) isValid = true;
+            else if (direction === 'down' && dy > 30) isValid = true;
+            else if (direction === 'up' && dy < -30) isValid = true;
+
+            if (isValid) {
+                const dist = (direction === 'up' || direction === 'down')
+                    ? Math.abs(dy) * 1.0 + Math.abs(dx) * 2.0
+                    : Math.abs(dx) * 1.0 + Math.abs(dy) * 2.0;
+
+                if (dist < bestDistance) {
+                    bestDistance = dist;
+                    bestCandidate = card;
+                }
+            }
+        });
+
+        if (!bestCandidate) {
+            const idx = cards.indexOf(current);
+            if (direction === 'right' || direction === 'down') {
+                bestCandidate = cards[(idx + 1) % cards.length];
+            } else {
+                bestCandidate = cards[(idx - 1 + cards.length) % cards.length];
+            }
         }
 
-        const newTarget = cards[currentIndex];
-        lastSuccessCard = newTarget;
+        if (bestCandidate) {
+            lastSuccessCard = bestCandidate;
+            const ta = bestCandidate.querySelector('textarea, input[type="text"]');
+            if (ta) activeBarcode = ta.value || ta.getAttribute('value') || ta.textContent;
 
-        const ta = newTarget.querySelector('textarea[aria-hidden="true"], input[type="text"]');
-        if (ta) activeBarcode = ta.value || ta.getAttribute('value') || ta.textContent;
-
-        maintainFocusVisual();
-        newTarget.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+            maintainFocusVisual();
+            bestCandidate.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+        }
     }
 
     setInterval(() => {
@@ -1209,6 +1281,7 @@
         updateStatusSlotUI();
         updateDynamicButtonsUI();
         updateExemplarBannerUI();
+        checkAllGivenOutTrigger();
         fixKgtShelves();
     }, 200);
 
@@ -1220,7 +1293,6 @@
         if (btn && !btn.disabled) simulateRealClick(btn);
     }
 
-    // Надежный поиск главной кнопки действия (с поддержкой Провести оплату и любых сумм)
     function findMainActionButton() {
         // Приоритеты как в v7.9: модалки -> Выдать -> Оплата -> Аннуляция
         const priorities = ['Подтвердить', 'Попробовать ещё', 'Повторить', 'Выдать', 'Продолжить', 'Провести оплату', 'Оплатить', 'Аннулировать', 'На главную'];
@@ -1258,11 +1330,21 @@
         }
     }
 
+    function isCardReallyAnnulated(card) {
+        if (!card) return false;
+        const btns = Array.from(card.querySelectorAll('button'));
+        return btns.some(b => b.textContent.trim().startsWith('К аннуляции'));
+    }
+
     function triggerBtnToCheck() {
         const targetItem = getTargetItem();
         if (!targetItem) return;
-        const isAnnulated = targetItem.querySelector('[data-testid="btnToAnnulate"], [class*="_annulation_"]');
-        if (isAnnulated) return;
+
+        if (isCardReallyAnnulated(targetItem)) {
+            playAnnulateAlert();
+            return;
+        }
+
         const btn = targetItem.querySelector('[data-testid="btnToCheck"]');
         if (btn) simulateRealClick(btn);
     }
