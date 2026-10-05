@@ -643,14 +643,22 @@
 
         const card = btn.closest('[class*="_card_"]');
 
-        if (card && isCardReallyAnnulated(card)) {
+        const isAnnulated = card && (
+            card.textContent.includes('Отказ') ||
+            card.textContent.includes('аннуляци') ||
+            card.querySelector('[class*="_annulation_"]')
+        );
+
+        if (isAnnulated) {
             const reasonNum = getCardAnnulateReasonNum(card);
+
             setTimeout(() => {
-                if (!isCardReallyAnnulated(card)) {
+                const nowGiveOut = card.textContent.includes('К выдаче') && !card.textContent.includes('Отказ') && !card.textContent.includes('аннуляци');
+                if (nowGiveOut) {
                     openDropdownAndSelect(card, reasonNum);
-                    console.log(`[Smart Control] 🛡️ Аннуляция (причина ${reasonNum}) сохранена после проверки!`);
+                    console.log(`[Smart Control] 🛡️ Товар проверен, статус отказа успешно сохранен!`);
                 }
-            }, 300);
+            }, 350);
         }
 
         const match = btn.textContent.match(/•\s*(\d+)/);
@@ -660,7 +668,6 @@
             return;
         }
 
-        // Блокируем первый клик на экземплярах
         e.preventDefault();
         e.stopPropagation();
         e.stopImmediatePropagation();
@@ -689,6 +696,7 @@
             }
         }, 1000);
     }, true);
+
 
 
 
@@ -1357,6 +1365,7 @@
         const btn = targetItem.querySelector('[data-testid="btnToCheck"]');
         if (btn) simulateRealClick(btn);
     }
+
 
     function openDropdownAndSelect(targetItem, requestedNumOrDoubleScan) {
         if (!targetItem) return false;
