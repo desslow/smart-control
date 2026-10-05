@@ -422,6 +422,20 @@
             color: #fff !important;
         }
 
+        body.smart-focus-active [class*="_card_"].smart-control-selected {
+            order: -1 !important;
+            transition: all 0.3s ease !important;
+        }
+
+        /* Невыделенные карточки уходят вниз и размываются блюром */
+        body.smart-focus-active [class*="_card_"]:not(.smart-control-selected) {
+            order: 1 !important;
+            filter: blur(6px) opacity(0.3) !important;
+            pointer-events: none !important;
+            transition: all 0.3s ease !important;
+        }
+
+
         #smart-more-dropdown {
             position: absolute;
             bottom: calc(100% + 8px);
@@ -549,9 +563,9 @@
             audioWarningExemplar.play().catch(() => {});
         } catch (e) {}
     }
-    
-    const audioDuolingo = new Audio('https://sounds.myinstantplay.com/fi/duolingo-correct-sound-effect.mp3');
-    audioDuolingo.preload = 'auto';
+
+    const audioSuccessAll = new Audio('https://st.ozone.ru/s3/turbo-pvz-ui-bucket/mp3/success.mp3');
+    audioSuccessAll.preload = 'auto';
     let allGiveoutSoundPlayed = false;
 
     // ================= ПЛАШКА НАД ПАНЕЛЬЮ =================
@@ -621,12 +635,12 @@
         const card = btn.closest('[class*="_card_"]');
 
         // 4.1 ЗАЩИТА АННУЛЯЦИИ: Если товар аннулирован — блокируем проверку намертво!
-        if (card && (card.textContent.includes('К аннуляции') || card.querySelector('[class*="_annulation_"]'))) {
+        // ЗАЩИТА АННУЛЯЦИИ
+        if (card && isCardReallyAnnulated(card)) {
             e.preventDefault();
             e.stopPropagation();
             e.stopImmediatePropagation();
             playAnnulateAlert();
-            console.warn('[Smart Control] Товар аннулирован! Проверка заблокирована во избежание сброса.');
             return;
         }
 
@@ -678,8 +692,12 @@
         const sessionId = getCurrentSessionIdFromUrl();
         if (sessionId && sessionId !== currentSessionId) {
             currentSessionId = sessionId;
-            totalUnpaidDebt = 0;
-            currentPostingsData = null;
+
+            // 5. СБРОС ФОКУС-МОДА МЕЖДУ СЕССИЯМИ КЛИЕНТОВ
+            isFocusMode = false;
+            document.body.classList.remove('smart-focus-active');
+            const badge = document.getElementById('smart-focus-mode-badge');
+            if (badge) badge.style.display = 'none';
 
             let foundAtTime = sessionsMap.get(String(sessionId));
             if (!foundAtTime) {
@@ -699,12 +717,33 @@
         }
 
         const elapsed = Math.max(0, Math.floor((Date.now() - currentFoundAtTimestamp) / 1000));
-        const mins = String(Math.floor(elapsed / 60)).padStart(2, '0');
+        const hours = Math.floor(elapsed / 3600);
+        const mins = String(Math.floor((elapsed % 3600) / 60)).padStart(2, '0');
         const secs = String(elapsed % 60).padStart(2, '0');
-        timerEl.textContent = `⏱ ${mins}:${secs}`;
+
+        // Отображаем часы, если время перевалило за 60 минут
+        if (hours > 0) {
+            timerEl.textContent = `⏱ ${hours}:${mins}:${secs}`;
+        } else {
+            timerEl.textContent = `⏱ ${mins}:${secs}`;
+        }
     }
 
     // ================= ТОЧНЫЙ РАСЧЕТ ОПЛАТЫ ПО ЭКРАНУ =================
+    // ================= ТОЧНЫЙ РАСЧЕТ ОПЛАТЫ ПО ЭКРАНУ =================
+    function getCardPrice(card) {
+        const allEls = Array.from(card.querySelectorAll('*'));
+        for (let el of allEls) {
+            // Ищем элемент, содержащий символ ₽
+            if (el.children.length === 0 && el.textContent.includes('₽')) {
+                const clean = el.textContent.replace(/\s+/g, '').replace(/[^\d,.]/g, '').replace(',', '.');
+                const val = parseFloat(clean);
+                if (!isNaN(val) && val > 0) return val;
+            }
+        }
+        return 0;
+    }
+
     function updateStatusSlotUI() {
         const slotEl = document.getElementById('smart-status-slot');
         if (!slotEl) return;
@@ -718,24 +757,17 @@
             const isUnpaid = card.textContent.includes('Требуется оплата');
             if (!isUnpaid) return;
 
-            // Достаем цену именно этой позиции
-            const priceEl = card.querySelector('[class*="_price_"]');
-            let price = 0;
-            if (priceEl) {
-                const match = priceEl.textContent.replace(/\s+/g, '').match(/(\d+(?:[.,]\d+)?)/);
-                if (match) price = parseFloat(match[1].replace(',', '.'));
-            }
-
+            const price = getCardPrice(card);
             totalDebt += price;
 
-            // Если товар отмечен "К выдаче" (зеленый) и НЕ аннулирован
+            // Если товар готов к выдаче (зеленая кнопка) и не аннулирован
             const isGiveOut = card.textContent.includes('К выдаче') && !card.textContent.includes('К аннуляции');
             if (isGiveOut) {
                 readyToPay += price;
             }
         });
 
-        // 1. Если нет неоплаченных товаров вообще -> "✓ Оплачено"
+        // 1. Если на экране НЕТ карточек с "Требуется оплата" -> "✓ Оплачено"
         if (totalDebt === 0) {
             slotEl.className = 'pay-clean';
             slotEl.innerHTML = `✓ Оплачено`;
@@ -745,12 +777,12 @@
 
         slotEl.className = 'pay-needed';
 
-        // 2. Если пикнут хотя бы один неоплаченный товар -> "Сумма: 2108/3438 ₽"
+        // 2. Если пикнут товар к выдаче -> "Сумма: 2108/3438 ₽"
         if (readyToPay > 0) {
             slotEl.innerHTML = `<span class="pay-dot"></span>Сумма: ${readyToPay}/${totalDebt} ₽`;
             slotEl.title = `К списанию сейчас: ${readyToPay} ₽ (Всего к оплате: ${totalDebt} ₽)`;
-        } 
-        // 3. До первого пикнутого -> вся сумма долга
+        }
+        // 3. До первого пикнутого -> "Сумма: 3438 ₽"
         else {
             slotEl.innerHTML = `<span class="pay-dot"></span>Сумма: ${totalDebt} ₽`;
             slotEl.title = `Общий долг по заказу: ${totalDebt} ₽`;
@@ -885,7 +917,7 @@
             }
         });
     }
-    
+
     function checkAllGivenOutTrigger() {
         const cards = getAllCards();
         if (cards.length === 0) return;
@@ -1197,27 +1229,66 @@
         setTimeout(() => { isDraggingSelection = false; }, 50);
     }, true);
 
+    // ================= УМНАЯ 2D-НАВИГАЦИЯ СТРЕЛКАМИ =================
     function navigateCards(direction) {
         const cards = getAllCards();
         if (cards.length === 0) return;
 
-        let currentIndex = cards.indexOf(getTargetItem());
-        if (currentIndex === -1) currentIndex = 0;
+        const current = getTargetItem() || cards[0];
+        const curRect = current.getBoundingClientRect();
+        const curCenterX = curRect.left + curRect.width / 2;
+        const curCenterY = curRect.top + curRect.height / 2;
 
-        if (direction === 'down' || direction === 'right') {
-            currentIndex = (currentIndex + 1) % cards.length;
-        } else if (direction === 'up' || direction === 'left') {
-            currentIndex = (currentIndex - 1 + cards.length) % cards.length;
+        let bestCandidate = null;
+        let bestDistance = Infinity;
+
+        cards.forEach(card => {
+            if (card === current) return;
+            const r = card.getBoundingClientRect();
+            const cx = r.left + r.width / 2;
+            const cy = r.top + r.height / 2;
+
+            const dx = cx - curCenterX;
+            const dy = cy - curCenterY;
+
+            let isValid = false;
+
+            if (direction === 'right' && dx > 30 && Math.abs(dy) < r.height) isValid = true;
+            else if (direction === 'left' && dx < -30 && Math.abs(dy) < r.height) isValid = true;
+            else if (direction === 'down' && dy > 30) isValid = true;
+            else if (direction === 'up' && dy < -30) isValid = true;
+
+            if (isValid) {
+                // Взвешенное расстояние с приоритетом нужной оси
+                const dist = (direction === 'up' || direction === 'down')
+                    ? Math.abs(dy) * 1.0 + Math.abs(dx) * 2.0
+                    : Math.abs(dx) * 1.0 + Math.abs(dy) * 2.0;
+
+                if (dist < bestDistance) {
+                    bestDistance = dist;
+                    bestCandidate = card;
+                }
+            }
+        });
+
+        // Если кандидата на 2D-плоскости нет, делаем обычный шаг
+        if (!bestCandidate) {
+            const idx = cards.indexOf(current);
+            if (direction === 'right' || direction === 'down') {
+                bestCandidate = cards[(idx + 1) % cards.length];
+            } else {
+                bestCandidate = cards[(idx - 1 + cards.length) % cards.length];
+            }
         }
 
-        const newTarget = cards[currentIndex];
-        lastSuccessCard = newTarget;
+        if (bestCandidate) {
+            lastSuccessCard = bestCandidate;
+            const ta = bestCandidate.querySelector('textarea, input[type="text"]');
+            if (ta) activeBarcode = ta.value || ta.getAttribute('value') || ta.textContent;
 
-        const ta = newTarget.querySelector('textarea[aria-hidden="true"], input[type="text"]');
-        if (ta) activeBarcode = ta.value || ta.getAttribute('value') || ta.textContent;
-
-        maintainFocusVisual();
-        newTarget.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+            maintainFocusVisual();
+            bestCandidate.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+        }
     }
 
     setInterval(() => {
@@ -1284,12 +1355,19 @@
         }
     }
 
+    function isCardReallyAnnulated(card) {
+        if (!card) return false;
+        // Проверяем видимую кнопку: она должна начинаться с "К аннуляции"
+        const btns = Array.from(card.querySelectorAll('button'));
+        return btns.some(b => b.textContent.trim().startsWith('К аннуляции'));
+    }
+
     function triggerBtnToCheck() {
         const targetItem = getTargetItem();
         if (!targetItem) return;
 
-        // Если товар аннулирован — не проверяем его
-        if (targetItem.textContent.includes('К аннуляции') || targetItem.querySelector('[class*="_annulation_"]')) {
+        // Если товар реально переведен в отказ — не сбиваем его
+        if (isCardReallyAnnulated(targetItem)) {
             playAnnulateAlert();
             return;
         }
@@ -1297,7 +1375,7 @@
         const btn = targetItem.querySelector('[data-testid="btnToCheck"]');
         if (btn) simulateRealClick(btn);
     }
-    
+
     function openDropdownAndSelect(targetItem, requestedNumOrDoubleScan) {
         if (!targetItem) return false;
         const isDoubleScan = requestedNumOrDoubleScan === 'DOUBLE_SCAN';
