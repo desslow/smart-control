@@ -1,0 +1,469 @@
+// ==UserScript==
+// @name         Ozon Smart Control (Core Keyboard)
+// @namespace    http://tampermonkey.net/
+// @version      9.0
+// @description  Легковесный клавиатурный драйвер выдачи: Enter, пакеты, дабл-причины, защита экземпляров
+// @author       desslow
+// @match        https://*.ozon.ru/*
+// @run-at       document-start
+// @grant        none
+// ==/UserScript==
+
+(function() {
+    'use strict';
+
+    function isOrdersPage() {
+        const path = window.location.pathname;
+        return path.includes('/orders') && !path.includes('/outbound');
+    }
+
+    // ================= КОНСТАНТЫ КЛАВИШ =================
+    const KEY_ENTER = 'NumpadEnter';
+    const KEY_ADD = 'NumpadAdd';
+    const KEY_SUBTRACT = 'NumpadSubtract';
+    const KEY_MULTIPLY = 'NumpadMultiply';
+    const REASON_KEYS = ['Numpad1', 'Numpad2', 'Numpad3', 'Numpad4', 'Numpad5'];
+
+    const SOUND_WARNING = 'https://st.ozone.ru/s3/turbo-pvz-ui-bucket/mp3/warning.mp3';
+    const audioWarning = new Audio(SOUND_WARNING);
+    audioWarning.preload = 'auto';
+
+    // ================= СОСТОЯНИЕ =================
+    let activePackageIndex = 0;
+    let hoveredCard = null;
+
+    let isEnterHolding = false;
+    let enterCompleted = false;
+    let heldButton = null;
+    let enterHoldTimeout = null;
+
+    let numpadReasonPresses = {};
+    let numpadReasonTimers = {};
+
+    // ================= СТИЛИ (АНИМАЦИИ И ИНДИКАЦИЯ) =================
+    const style = document.createElement('style');
+    style.innerHTML = `
+        /* Индикатор активности Smart Control: плавная световая волна на кнопке действия */
+        @keyframes smartGlowFlow {
+            0%   { background-position: 0% 50%; box-shadow: 0 4px 14px rgba(0, 91, 255, 0.35); }
+            50%  { background-position: 100% 50%; box-shadow: 0 4px 22px rgba(0, 122, 255, 0.65); }
+            100% { background-position: 0% 50%; box-shadow: 0 4px 14px rgba(0, 91, 255, 0.35); }
+        }
+        .smart-action-active {
+            background: linear-gradient(90deg, #005bff, #0080ff, #005bff) !important;
+            background-size: 200% 200% !important;
+            animation: smartGlowFlow 2.5s ease infinite !important;
+            transition: all 0.2s ease !important;
+        }
+
+        /* Блокировка кнопки, если все на хранении */
+        .smart-action-locked {
+            opacity: 0.45 !important;
+            filter: grayscale(0.6) !important;
+            pointer-events: none !important;
+            box-shadow: none !important;
+            animation: none !important;
+        }
+
+        /* Полоса прогресса удержания Enter на оплату */
+        .smart-btn-progress { position: relative !important; overflow: hidden !important; }
+        .smart-btn-progress::after {
+            content: ''; position: absolute; top: 0; left: 0; bottom: 0;
+            width: var(--smart-progress, 0%); background-color: rgba(228, 0, 124, 0.55) !important;
+            transition: width 0.4s linear, opacity 0.2s ease-out; pointer-events: none; z-index: 10; border-radius: inherit;
+        }
+        .smart-btn-progress.done::after { opacity: 0; }
+
+        /* Безопасная блокировка экземпляров (без краша Vue) */
+        .smart-btn-countdown-locked {
+            position: relative !important;
+            pointer-events: none !important;
+            cursor: not-allowed !important;
+        }
+        .smart-btn-countdown-locked::after {
+            content: attr(data-smart-cd-text);
+            position: absolute !important;
+            top: 0; left: 0; right: 0; bottom: 0;
+            background: #ef4444 !important;
+            color: #ffffff !important;
+            font-size: 13px !important;
+            font-weight: 700 !important;
+            display: flex !important;
+            align-items: center !important;
+            justify-content: center !important;
+            z-index: 9999 !important;
+            border-radius: inherit !important;
+        }
+
+        /* Бейджи причин в меню */
+        .numpad-badge-helper {
+            margin-left: 10px;
+            padding: 2px 6px;
+            background: #e4e6e9;
+            color: #4e5b6c;
+            border: 1px solid #cbced4;
+            border-radius: 4px;
+            font-size: 11px;
+            font-weight: bold;
+            font-family: monospace;
+            display: inline-block;
+        }
+    `;
+    document.head.appendChild(style);
+
+    // ================= СЛУЖЕБНЫЕ =================
+    function isInputActive() {
+        const el = document.activeElement;
+        return el && (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' || el.isContentEditable);
+    }
+
+    function simulateRealClick(element) {
+        if (!element) return;
+        ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click'].forEach(type => {
+            const ev = new MouseEvent(type, { bubbles: true, cancelable: true, view: window, buttons: 1 });
+            element.dispatchEvent(ev);
+        });
+    }
+
+    // Слежение за карточкой под курсором (для выбора причины по Num 1..5)
+    document.addEventListener('mouseover', (e) => {
+        if (!isOrdersPage()) return;
+        const c = e.target.closest('[class*="_card_"]');
+        if (c) hoveredCard = c;
+    }, { passive: true });
+
+    // ================= ПАКЕТЫ =================
+    function highlightActivePackage() {
+        const counters = document.querySelectorAll('[class*="input-count__group"]');
+        counters.forEach((counter, idx) => {
+            if (idx === activePackageIndex) {
+                counter.style.outline = '3px solid #005bff';
+                counter.style.outlineOffset = '2px';
+                counter.style.borderRadius = '4px';
+                counter.style.boxShadow = '0 0 8px rgba(0, 91, 255, 0.5)';
+            } else {
+                counter.style.outline = 'none';
+                counter.style.boxShadow = 'none';
+            }
+        });
+    }
+
+    function adjustPackage(action) {
+        const counters = document.querySelectorAll('[class*="input-count__group"]');
+        if (counters.length <= activePackageIndex) return;
+        const buttonClass = action === 'increment' ? '[class*="increment"]' : '[class*="decrement"]';
+        const btn = counters[activePackageIndex].querySelector(buttonClass);
+        if (btn && !btn.disabled) simulateRealClick(btn);
+    }
+
+    // ================= ГЛАВНАЯ КНОПКА И ИНДИКАЦИЯ =================
+    function findMainActionButton() {
+        const giveOutBtn = document.querySelector('[data-testid="giveOutActionButton"]');
+        if (giveOutBtn && !giveOutBtn.disabled) return giveOutBtn;
+
+        const priorities = ['Провести оплату', 'Оплатить', 'Подтвердить', 'Попробовать ещё', 'Повторить', 'Выдать', 'Продолжить', 'Аннулировать', 'На главную'];
+        const allButtons = Array.from(document.querySelectorAll('button:not([class*="smart-"])'));
+
+        for (let text of priorities) {
+            const btn = allButtons.find(b => {
+                if (b.disabled || b.getAttribute('aria-disabled') === 'true') return false;
+                return b.textContent.includes(text);
+            });
+            if (btn) return btn;
+        }
+        return giveOutBtn;
+    }
+
+    // Индикация скрипта: волна готовности или блокировка
+    function updateScriptAliveState() {
+        const mainBtn = findMainActionButton();
+        if (!mainBtn) return;
+
+        // Смотрим счетчики Озона в правом блоке
+        const rightBlock = document.querySelector('[class*="_right_"]') || document.body;
+        const text = rightBlock.textContent;
+
+        const isNothingToGive = text.includes('К выдаче') && text.includes('На хранении') &&
+                                text.match(/К выдаче\s*0/) && !text.match(/К аннуляции\s*[1-9]/);
+
+        if (isNothingToGive) {
+            mainBtn.classList.remove('smart-action-active');
+            mainBtn.classList.add('smart-action-locked');
+        } else {
+            mainBtn.classList.remove('smart-action-locked');
+            mainBtn.classList.add('smart-action-active');
+        }
+    }
+
+    // ================= ПРОВЕРКА ЭКЗЕМПЛЯРОВ =================
+    function showExemplarSideToast(count) {
+        let toast = document.getElementById('smart-exemplar-side-toast');
+        if (toast) toast.remove();
+
+        toast = document.createElement('div');
+        toast.id = 'smart-exemplar-side-toast';
+        toast.style.cssText = `
+            position: fixed !important;
+            top: 24px !important;
+            right: 24px !important;
+            z-index: 9999999 !important;
+            background: rgba(22, 29, 45, 0.98) !important;
+            border: 2px solid #ef4444 !important;
+            box-shadow: 0 8px 30px rgba(239, 68, 68, 0.45) !important;
+            border-radius: 12px !important;
+            padding: 12px 16px !important;
+            color: #ffffff !important;
+            font-size: 13px !important;
+            max-width: 320px !important;
+            display: flex !important;
+            align-items: flex-start !important;
+            gap: 10px !important;
+        `;
+        toast.innerHTML = `
+            <span style="font-size: 20px;">⚠️</span>
+            <div>
+                <div style="font-weight: bold; color: #f87171; margin-bottom: 2px;">Проверка количества!</div>
+                <div>В позиции <b>${count} шт.</b> Сверьте физическое количество с системным перед выдачей!</div>
+            </div>
+        `;
+        document.body.appendChild(toast);
+
+        try {
+            audioWarning.currentTime = 0;
+            audioWarning.play().catch(() => {});
+        } catch(e) {}
+
+        setTimeout(() => { if (toast) toast.remove(); }, 8000);
+    }
+
+    // Перехват клика по кнопке с точкой "•"
+    document.addEventListener('click', function(e) {
+        const btn = e.target.closest('[data-testid="btnToCheck"]');
+        if (!btn) return;
+
+        const match = btn.textContent.match(/•\s*(\d+)/);
+        if (!match) return;
+
+        if (btn.dataset.exemplarState === 'unlocked') {
+            return;
+        }
+
+        e.preventDefault();
+        e.stopPropagation();
+        e.stopImmediatePropagation();
+
+        if (btn.dataset.exemplarState === 'cooling') return;
+
+        const count = match[1];
+        btn.dataset.exemplarState = 'cooling';
+
+        showExemplarSideToast(count);
+
+        let timeLeft = 10;
+        btn.classList.add('smart-btn-countdown-locked');
+        btn.setAttribute('data-smart-cd-text', `Сверьте: ${timeLeft} сек`);
+
+        const cdTimer = setInterval(() => {
+            timeLeft--;
+            btn.setAttribute('data-smart-cd-text', `Сверьте: ${timeLeft} сек`);
+
+            if (timeLeft <= 0) {
+                clearInterval(cdTimer);
+                btn.classList.remove('smart-btn-countdown-locked');
+                btn.removeAttribute('data-smart-cd-text');
+                btn.dataset.exemplarState = 'unlocked';
+            }
+        }, 1000);
+    }, true);
+
+    // ================= ВЫБОР ПРИЧИН ДАБЛ-ЦИФРАМИ =================
+    function injectReasonNumbers() {
+        const dropdownItems = document.querySelectorAll('[data-testid^="postingDropDownItemToAnnulate"]');
+        if (dropdownItems.length === 0) return;
+
+        const usedNums = new Set();
+        dropdownItems.forEach(item => {
+            const labelContainer = item.querySelector('[class*="data-content__label"]') || item;
+            const existingBadge = labelContainer.querySelector('.numpad-badge-helper');
+            if (existingBadge) {
+                usedNums.add(parseInt(existingBadge.dataset.reasonNum, 10));
+                return;
+            }
+
+            let text = labelContainer.textContent.toLowerCase();
+            let num = null;
+            if (text.includes('брак') || text.includes('поврежд') || text.includes('разбит') || text.includes('дефект')) num = 1;
+            else if (text.includes('ошиб') || text.includes('не тот') || text.includes('подмен') || text.includes('пересорт')) num = 2;
+            else if (text.includes('неполн') || text.includes('пуст') || text.includes('част') || text.includes('вскрыт')) num = 3;
+            else if (text.includes('решени') || text.includes('отказ') || text.includes('клиент') || text.includes('передумал')) num = 4;
+            else if (text.includes('срок') || text.includes('просроч') || text.includes('проч') || text.includes('опозд')) num = 5;
+
+            if (num) { item.dataset.fixedNum = num; usedNums.add(num); }
+        });
+
+        dropdownItems.forEach(item => {
+            const labelContainer = item.querySelector('[class*="data-content__label"]') || item;
+            if (labelContainer.querySelector('.numpad-badge-helper')) return;
+
+            let num = item.dataset.fixedNum;
+            if (!num) {
+                for (let i = 1; i <= 9; i++) {
+                    if (!usedNums.has(i)) { num = i; usedNums.add(i); break; }
+                }
+            }
+
+            if (num) {
+                const badge = document.createElement('span');
+                badge.className = 'numpad-badge-helper';
+                badge.dataset.reasonNum = num;
+                badge.textContent = `[Num ${num}]`;
+                labelContainer.appendChild(badge);
+            }
+        });
+    }
+
+    function openDropdownAndSelect(targetCard, requestedNum) {
+        if (!targetCard) {
+            // Если курсор не над карточкой, берем первую подходящую
+            targetCard = document.querySelector('[class*="_card_"]');
+        }
+        if (!targetCard) return;
+
+        const selectFromOpenMenu = () => {
+            const badge = document.querySelector(`.numpad-badge-helper[data-reason-num="${requestedNum}"]`);
+            let targetOption = badge ? badge.closest('[data-testid^="postingDropDownItemToAnnulate"]') : null;
+            if (!targetOption) {
+                const options = Array.from(document.querySelectorAll('[data-testid^="postingDropDownItemToAnnulate"]'));
+                if (options[requestedNum - 1]) targetOption = options[requestedNum - 1];
+            }
+            if (targetOption) simulateRealClick(targetOption.closest('button') || targetOption.closest('[role="menuitem"]') || targetOption);
+        };
+
+        if (document.querySelectorAll('[data-testid^="postingDropDownItemToAnnulate"]').length > 0) {
+            injectReasonNumbers();
+            selectFromOpenMenu();
+            return;
+        }
+
+        const splitBtns = targetCard.querySelectorAll('[class*="splitButton"] button');
+        let arrowBtn = splitBtns.length >= 2 ? splitBtns[splitBtns.length - 1] : null;
+        if (!arrowBtn) {
+            arrowBtn = Array.from(targetCard.querySelectorAll('button')).find(b => b.querySelector('svg') && !b.textContent.trim());
+        }
+
+        if (!arrowBtn) return;
+        simulateRealClick(arrowBtn);
+
+        let attempts = 0;
+        const checkIv = setInterval(() => {
+            attempts++;
+            if (document.querySelectorAll('[data-testid^="postingDropDownItemToAnnulate"]').length > 0) {
+                clearInterval(checkIv);
+                injectReasonNumbers();
+                selectFromOpenMenu();
+            } else if (attempts > 15) {
+                clearInterval(checkIv);
+            }
+        }, 80);
+    }
+
+    // ================= ОБРАБОТЧИК КЛАВИАТУРЫ =================
+    window.addEventListener('keydown', function(e) {
+        if (!isOrdersPage()) return;
+
+        if (e.key === 'Escape') {
+            const backBtn = document.querySelector('button path[d^="M6.293 2.293"]')?.closest('button');
+            if (backBtn) {
+                e.preventDefault(); e.stopPropagation();
+                simulateRealClick(backBtn);
+            }
+            return;
+        }
+
+        if (isInputActive() && e.code !== KEY_ENTER) return;
+
+        // Пакеты
+        if (e.code === KEY_MULTIPLY) {
+            e.preventDefault(); e.stopPropagation();
+            activePackageIndex = activePackageIndex === 0 ? 1 : 0;
+            highlightActivePackage();
+            return;
+        }
+
+        if (e.code === KEY_ADD || e.code === KEY_SUBTRACT) {
+            e.preventDefault(); e.stopPropagation();
+            adjustPackage(e.code === KEY_ADD ? 'increment' : 'decrement');
+            return;
+        }
+
+        // Дабл-причины 1..5
+        if (REASON_KEYS.includes(e.code)) {
+            e.preventDefault(); e.stopPropagation();
+            const requestedNum = REASON_KEYS.indexOf(e.code) + 1;
+            numpadReasonPresses[e.code] = (numpadReasonPresses[e.code] || 0) + 1;
+
+            if (numpadReasonPresses[e.code] === 1) {
+                numpadReasonTimers[e.code] = setTimeout(() => { numpadReasonPresses[e.code] = 0; }, 350);
+            } else if (numpadReasonPresses[e.code] === 2) {
+                clearTimeout(numpadReasonTimers[e.code]);
+                numpadReasonPresses[e.code] = 0;
+                openDropdownAndSelect(hoveredCard, requestedNum);
+            }
+            return;
+        }
+
+        // Numpad Enter (Выдача / Оплата)
+        if (e.code === KEY_ENTER) {
+            e.preventDefault(); e.stopPropagation();
+            if (isEnterHolding || enterCompleted) return;
+
+            const mainBtn = findMainActionButton();
+            if (!mainBtn || mainBtn.classList.contains('smart-action-locked')) return;
+
+            const btnText = mainBtn.textContent.trim();
+            const isPayment = btnText.includes('Провести оплату') || btnText.includes('Оплатить') || btnText.includes('Попробовать ещё');
+
+            if (isPayment) {
+                isEnterHolding = true;
+                heldButton = mainBtn;
+                heldButton.classList.add('smart-btn-progress');
+                heldButton.classList.remove('done');
+                void heldButton.offsetWidth;
+                heldButton.style.setProperty('--smart-progress', '100%');
+
+                enterHoldTimeout = setTimeout(() => {
+                    heldButton.classList.add('done');
+                    simulateRealClick(heldButton);
+                    isEnterHolding = false;
+                    enterCompleted = true;
+                    heldButton = null;
+                }, 400);
+            } else {
+                enterCompleted = true;
+                simulateRealClick(mainBtn);
+            }
+        }
+    }, true);
+
+    window.addEventListener('keyup', function(e) {
+        if (!isOrdersPage()) return;
+        if (e.code === KEY_ENTER) {
+            enterCompleted = false;
+            if (isEnterHolding) {
+                clearTimeout(enterHoldTimeout);
+                if (heldButton) heldButton.style.setProperty('--smart-progress', '0%');
+                isEnterHolding = false;
+                heldButton = null;
+            }
+        }
+    }, true);
+
+    // ================= ТИК =================
+    setInterval(() => {
+        if (!isOrdersPage()) return;
+        highlightActivePackage();
+        injectReasonNumbers();
+        updateScriptAliveState();
+    }, 250);
+
+})();
